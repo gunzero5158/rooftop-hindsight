@@ -1,13 +1,11 @@
-import { Candle, HindsightKeyLevel, HindsightSummaryPayload, MarketCode, exportKeyLevel } from "../shared-types/interop";
-import { AtomPreScanResult } from "./univariatePreScan";
-import { KeyLevelTouchStat } from "./keyLevelStats";
-import { SwingSegment, ConditionAtom, HindsightHypothesis, TimelineFeatures } from "./types";
+import { Candle, HindsightKeyLevel, HindsightSummaryPayload, MarketCode, TimeframeCode, exportKeyLevel } from "../shared-types/interop";
+import { AtomPreScanResult, buildMagnitudeProfile, checkAtomCondition, enrichSwingsWithFeatures, preScanAllAtoms } from "./univariatePreScan";
+import { KeyLevelTouchStat, scanAllKeyLevels } from "./keyLevelStats";
+import { ConditionAtom, EvaluationResult, HindsightHypothesis, MagnitudeProfile, SwingSegment } from "./types";
 import { generateLocalHypotheses } from "./gridSearchFallback";
 import { evaluateHypothesis } from "./hypothesisEvaluator";
 import { extractSwings } from "./swingExtractor";
 import { buildFeatureTimeline } from "./featureTimeline";
-import { scanAllKeyLevels } from "./keyLevelStats";
-import { preScanAllAtoms } from "./univariatePreScan";
 
 export const ALLOWED_CATEGORIES = new Set([
   "bullish_entry",
@@ -240,8 +238,27 @@ export function validateAndSanitizeHypotheses(rawList: unknown): HindsightHypoth
   return validHypotheses;
 }
 
+const STATUS_RANK: Record<EvaluationResult["status"], number> = {
+  high_confidence: 0,
+  degraded: 1,
+  insufficient_sample: 2,
+};
+
+/**
+ * Ranks results: reliable samples first, then win rate, then trigger count.
+ */
+export function rankResults(results: EvaluationResult[]): EvaluationResult[] {
+  return [...results].sort(
+    (a, b) =>
+      STATUS_RANK[a.status] - STATUS_RANK[b.status] ||
+      b.winRate - a.winRate ||
+      b.triggerCount - a.triggerCount
+  );
+}
+
 /**
  * Executes full analysis pipeline for a given candle series.
+ * Bars before `warmupBars` only stabilize indicators and are excluded from all statistics.
  */
 export async function runHindsightPipeline(
   candles: Candle[],
@@ -249,24 +266,31 @@ export async function runHindsightPipeline(
     symbol: string;
     market: MarketCode;
     name?: string;
+    timeframe?: TimeframeCode;
     minSwingPct?: number;
     horizonBars?: number;
+    warmupBars?: number;
     apiKey?: string;
     model?: string;
   }
-): Promise<HindsightSummaryPayload & { hypothesesResults: ReturnType<typeof evaluateHypothesis>[] }> {
+): Promise<HindsightSummaryPayload & { hypothesesResults: EvaluationResult[]; swings: SwingSegment[]; magnitudeProfile: MagnitudeProfile; analysisStartIndex: number }> {
   const minSwingPct = options.minSwingPct ?? 0.10;
   const horizonBars = options.horizonBars ?? 40;
+  const timeframe = options.timeframe ?? "daily";
   const symbol = options.symbol;
   const market = options.market;
+  // Keep at least half of the series for analysis when history is short
+  const startIndex = Math.min(options.warmupBars ?? 0, Math.floor(candles.length / 2));
 
-  // 1. Swings & Timeline
-  const swings = extractSwings(candles, { minSwingPct });
+  // 1. Swings & Timeline (timeline uses full series so warmup stabilizes indicators)
   const timeline = buildFeatureTimeline(candles);
+  const rawSwings = extractSwings(candles, { minSwingPct, horizonBars }).filter(s => s.startIndex >= startIndex);
+  const swings = enrichSwingsWithFeatures(rawSwings, timeline);
 
-  // 2. Statistics
-  const keyLevelStats = scanAllKeyLevels(candles, timeline);
-  const preScanResults = preScanAllAtoms(candles, timeline, swings);
+  // 2. Statistics & Magnitude / Multiplier Profile
+  const keyLevelStats = scanAllKeyLevels(candles, timeline, startIndex);
+  const preScanResults = preScanAllAtoms(candles, timeline, swings, minSwingPct, horizonBars, startIndex);
+  const magnitudeProfile = buildMagnitudeProfile(swings, timeline, minSwingPct);
 
   // 3. Generate Hypotheses: local fallback is always generated to ensure stability
   const fallbackHypotheses = generateLocalHypotheses(preScanResults, keyLevelStats);
@@ -276,7 +300,8 @@ export async function runHindsightPipeline(
   const apiKey = options.apiKey || process.env.GEMINI_API_KEY || process.env.OPENROUTER_API_KEY;
   if (apiKey) {
     try {
-      const avgGain = swings.length > 0 ? swings.reduce((acc, s) => acc + s.gainPct, 0) / swings.length : 0;
+      // swing.gainPct is in percent; prompt context expects a fraction
+      const avgGain = swings.length > 0 ? swings.reduce((acc, s) => acc + s.gainPct, 0) / swings.length / 100 : 0;
       const medianDur = swings.length > 0 ? swings.map(s => s.durationBars).sort((a, b) => a - b)[Math.floor(swings.length / 2)] : 20;
 
       const prompt = buildHypothesisPrompt({
@@ -284,7 +309,7 @@ export async function runHindsightPipeline(
         market,
         minSwingPct,
         horizonBars,
-        totalBars: candles.length,
+        totalBars: candles.length - startIndex,
         swingsCount: swings.length,
         avgSwingGainPct: avgGain,
         medianSwingDuration: medianDur,
@@ -295,8 +320,7 @@ export async function runHindsightPipeline(
       // Call API if endpoint configured
       const aiResponse = await callAiProvider(prompt, apiKey, options.model);
       if (aiResponse) {
-        const parsed = JSON.parse(aiResponse);
-        const validated = validateAndSanitizeHypotheses(parsed);
+        const validated = validateAndSanitizeHypotheses(extractHypothesisArray(JSON.parse(aiResponse)));
         if (validated.length > 0) {
           // Merge validated AI hypotheses with top fallbacks
           hypothesesToEvaluate = [...validated, ...fallbackHypotheses.slice(0, 3)];
@@ -308,13 +332,12 @@ export async function runHindsightPipeline(
     }
   }
 
-  // 4. Evaluate each hypothesis
-  const results = hypothesesToEvaluate.map(h =>
-    evaluateHypothesis(candles, timeline, h, { minSwingPct, horizonBars })
+  // 4. Evaluate each hypothesis (drop rules that never fired)
+  const results = rankResults(
+    hypothesesToEvaluate
+      .map(h => evaluateHypothesis(candles, timeline, h, { minSwingPct, horizonBars, startIndex }))
+      .filter(r => r.triggerCount > 0)
   );
-
-  // Sort by winRate desc, then by triggerCount desc
-  results.sort((a, b) => b.winRate - a.winRate || b.triggerCount - a.triggerCount);
 
   // 5. Evaluate current status at the latest candle
   const latestIndex = candles.length - 1;
@@ -323,14 +346,9 @@ export async function runHindsightPipeline(
 
   const activeSignals: HindsightSummaryPayload["activeSignals"] = [];
   for (const r of results) {
-    // Check if latest candle satisfies conditions
-    const isTriggeredNow = r.hypothesis.conditions.every(c => {
-      // Import checkAtomCondition
-      const { checkAtomCondition } = require("./univariatePreScan");
-      return checkAtomCondition(latestFeature, c);
-    });
-
-    if (isTriggeredNow && r.winRate >= 0.6) {
+    const isTriggeredNow = r.hypothesis.conditions.every(c => checkAtomCondition(latestFeature, c));
+    // Only reliable rules qualify as an active signal
+    if (isTriggeredNow && r.status !== "insufficient_sample" && r.winRate >= 0.6) {
       activeSignals.push({
         title: r.hypothesis.title,
         category: r.hypothesis.category,
@@ -379,14 +397,29 @@ export async function runHindsightPipeline(
     market,
     name: options.name,
     analyzedAt: new Date().toISOString(),
-    lookbackYears: Number((candles.length / 250).toFixed(1)),
-    timeframe: "daily",
+    lookbackYears: Number(((candles.length - startIndex) / (timeframe === "weekly" ? 52 : 250)).toFixed(1)),
+    timeframe,
     minSwingPct,
     currentPrice,
     activeSignals,
     keyLevels,
     hypothesesResults: results,
+    swings,
+    magnitudeProfile,
+    analysisStartIndex: startIndex,
   };
+}
+
+/**
+ * Accepts either a bare array or an object wrapping the array (json_object mode returns objects).
+ */
+function extractHypothesisArray(parsed: unknown): unknown {
+  if (Array.isArray(parsed)) return parsed;
+  if (parsed && typeof parsed === "object") {
+    const firstArray = Object.values(parsed as Record<string, unknown>).find(Array.isArray);
+    if (firstArray) return firstArray;
+  }
+  return [];
 }
 
 async function callAiProvider(prompt: string, apiKey: string, model?: string): Promise<string | null> {
@@ -394,11 +427,14 @@ async function callAiProvider(prompt: string, apiKey: string, model?: string): P
   const isOpenRouter = apiKey.startsWith("sk-or-");
   const url = isOpenRouter
     ? "https://openrouter.ai/api/v1/chat/completions"
-    : `https://generativelanguage.googleapis.com/v1beta/models/${model || "gemini-2.5-flash"}:generateContent?key=${apiKey}`;
+    : `https://generativelanguage.googleapis.com/v1beta/models/${model || "gemini-2.5-flash"}:generateContent`;
 
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (isOpenRouter) {
     headers["Authorization"] = `Bearer ${apiKey}`;
+  } else {
+    // Header auth keeps the key out of URLs and access logs
+    headers["x-goog-api-key"] = apiKey;
   }
 
   const body = isOpenRouter
@@ -412,7 +448,7 @@ async function callAiProvider(prompt: string, apiKey: string, model?: string): P
         generationConfig: { responseMimeType: "application/json" },
       });
 
-  const res = await fetch(url, { method: "POST", headers, body });
+  const res = await fetch(url, { method: "POST", headers, body, signal: AbortSignal.timeout(30000) });
   if (!res.ok) return null;
 
   const data = await res.json();

@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { Candle } from "@/lib/shared-types/interop";
 import { extractSwingSegments } from "../swingExtractor";
+import { buildFeatureTimeline } from "../featureTimeline";
+import { buildMagnitudeProfile, enrichSwingsWithFeatures } from "../univariatePreScan";
 
 function createFlatCandles(count: number, basePrice: number = 100): Candle[] {
   const candles: Candle[] = [];
@@ -113,5 +115,43 @@ describe("swingExtractor", () => {
     expect(peak!.startPrice).toBe(150.0);
     expect(peak!.peakPrice).toBe(132.0);
     expect(peak!.gainPct).toBe(-12.0);
+  });
+
+  it("TC-SW-05: Rebound multiplier profile and trough indicator feature attribution", () => {
+    const candles = createFlatCandles(200, 100);
+
+    // Swing 1 at bar 40: low volume contraction (volume 300 vs 1000) + big 40% rebound (100 -> 140)
+    candles[39] = { ...candles[39], low: 98, close: 98 };
+    candles[40] = { ...candles[40], open: 97, high: 98, low: 95.0, close: 96, volume: 300 };
+    candles[55] = { ...candles[55], open: 130, high: 133.0, low: 129, close: 132 }; // +40% from 95
+
+    // Swing 2 at bar 100: low volume contraction + big 30% rebound (95 -> 123.5)
+    candles[99] = { ...candles[99], low: 98, close: 98 };
+    candles[100] = { ...candles[100], open: 97, high: 98, low: 95.0, close: 96, volume: 300 };
+    candles[115] = { ...candles[115], open: 121, high: 123.5, low: 120, close: 122 }; // +30% from 95
+
+    // Swing 3 at bar 150: normal volume + modest 12% rebound (95 -> 106.4)
+    candles[149] = { ...candles[149], low: 98, close: 98 };
+    candles[150] = { ...candles[150], open: 97, high: 98, low: 95.0, close: 96, volume: 1200 };
+    candles[165] = { ...candles[165], open: 105, high: 106.4, low: 104, close: 106 }; // +12% from 95
+
+    const timeline = buildFeatureTimeline(candles);
+    const { successfulSwings } = extractSwingSegments(candles, 0.10, 30);
+    const enriched = enrichSwingsWithFeatures(successfulSwings, timeline);
+    const profile = buildMagnitudeProfile(enriched, timeline, 0.10);
+
+    expect(enriched.length).toBe(3);
+    expect(enriched[0].multiplier).toBe(1.4);
+    expect(enriched[0].entryFeatures).toBeDefined();
+    expect(enriched[0].entryFeatures!.volumeRatio20).toBeLessThan(0.5);
+
+    expect(profile.maxGainPct).toBe(40);
+    expect(profile.maxMultiplier).toBe(1.4);
+    expect(profile.avgGainPct).toBeCloseTo(27.33, 1);
+
+    const volDriver = profile.topMagnitudeDrivers.find(d => d.atom.type === "volume_ratio");
+    expect(volDriver).toBeDefined();
+    expect(volDriver!.avgGainWhenPresent).toBe(35);
+    expect(volDriver!.liftVsBaselinePct).toBeGreaterThan(5);
   });
 });

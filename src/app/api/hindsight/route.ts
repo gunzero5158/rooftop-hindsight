@@ -1,28 +1,38 @@
 import { NextRequest, NextResponse } from "next/server";
 import { fetchHistoricalCandles } from "@/lib/market/marketService";
 import { runHindsightPipeline } from "@/lib/hindsight/aiPipeline";
-import { extractSwings } from "@/lib/hindsight/swingExtractor";
 import { detectMarket } from "@/lib/market/symbolConversion";
-import { TimeframeCode } from "@/lib/shared-types/interop";
+import { MarketCode, TimeframeCode } from "@/lib/shared-types/interop";
+
+const MARKETS: MarketCode[] = ["CN", "HK", "US", "JP"];
+const WARMUP_BARS = 250;
+
+function clampNumber(raw: string | null, fallback: number, min: number, max: number): number {
+  const v = raw === null ? NaN : parseFloat(raw);
+  return Number.isFinite(v) ? Math.min(max, Math.max(min, v)) : fallback;
+}
 
 export async function GET(req: NextRequest) {
   try {
     const { searchParams } = new URL(req.url);
-    const symbol = searchParams.get("symbol") || "600519";
-    const market = (searchParams.get("market") as any) || detectMarket(symbol);
-    const timeframe = (searchParams.get("timeframe") as TimeframeCode) || "daily";
-    const minSwingPct = parseFloat(searchParams.get("minSwingPct") || "0.10");
-    const years = parseFloat(searchParams.get("years") || "3");
+    const symbol = (searchParams.get("symbol") || "600519").trim();
+    const rawMarket = searchParams.get("market") as MarketCode | null;
+    const market: MarketCode = rawMarket && MARKETS.includes(rawMarket) ? rawMarket : detectMarket(symbol);
+    const timeframe: TimeframeCode = searchParams.get("timeframe") === "weekly" ? "weekly" : "daily";
+    const minSwingPct = clampNumber(searchParams.get("minSwingPct"), 0.10, 0.03, 0.5);
+    const years = clampNumber(searchParams.get("years"), 3, 1, 5);
+    // Weekly warmup in weeks keeps the same ~1 year of indicator stabilization
+    const warmupBars = timeframe === "weekly" ? 52 : WARMUP_BARS;
 
-    // 1. Fetch candles
-    const { candles, isMock } = await fetchHistoricalCandles(symbol, {
+    // 1. Fetch candles (lookback + indicator warmup)
+    const { candles, isMock, symbol: normalizedSymbol } = await fetchHistoricalCandles(symbol, {
       years,
       timeframe,
-      warmupBars: 250,
+      warmupBars,
       allowMockFallback: true,
     });
 
-    if (candles.length < 30) {
+    if (candles.length < 60) {
       return NextResponse.json(
         { error: `Insufficient candle data for symbol: ${symbol}` },
         { status: 400 }
@@ -31,27 +41,25 @@ export async function GET(req: NextRequest) {
 
     // 2. Run core hindsight pipeline
     const pipelineResult = await runHindsightPipeline(candles, {
-      symbol,
+      symbol: normalizedSymbol,
       market,
+      timeframe,
       minSwingPct,
+      warmupBars,
       horizonBars: timeframe === "weekly" ? 15 : 40,
     });
-
-    // 3. Extract swings for chart annotation
-    const swings = extractSwings(candles, { minSwingPct });
 
     return NextResponse.json({
       success: true,
       ...pipelineResult,
       isMock,
-      swings,
-      // Pass the recent candles for chart rendering (keep payload light)
-      candles: candles.slice(-500),
+      // Full series: triggeredIndices / swing indices are positions in this array
+      candles,
     });
-  } catch (err: any) {
+  } catch (err: unknown) {
     console.error("API /api/hindsight error:", err);
     return NextResponse.json(
-      { error: err?.message || "Internal server error" },
+      { error: err instanceof Error ? err.message : "Internal server error" },
       { status: 500 }
     );
   }

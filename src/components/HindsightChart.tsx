@@ -119,7 +119,7 @@ export default function HindsightChart({
           position: "belowBar",
           color: "#10b981",
           shape: "arrowUp",
-          text: `+${(s.gainPct * 100).toFixed(0)}%`,
+          text: `+${s.gainPct.toFixed(0)}%`,
         });
       }
     }

@@ -27,6 +27,16 @@ export interface HindsightHypothesis {
   aiRationale: string;
 }
 
+export interface SwingEntryFeatures {
+  nearestMa?: string;       // e.g. "EMA60 (-1.2%)"
+  kdjJ: number;
+  rsi: number;
+  volumeRatio20: number;
+  macdState?: string;       // e.g. "MACD底背离" | "MACD金叉"
+  patterns: string[];       // e.g. ["锤头线", "长下影"]
+  matchedTags: string[];    // Concise indicator tags at startup low
+}
+
 export interface SwingSegment {
   startIndex: number;
   startDate: string;
@@ -35,8 +45,10 @@ export interface SwingSegment {
   peakDate: string;
   peakPrice: number;
   gainPct: number;
+  multiplier?: number;      // peakPrice / startPrice, e.g. 1.25
   durationBars: number;
   isWin: boolean;
+  entryFeatures?: SwingEntryFeatures;
 }
 
 export interface TimelineFeatures {
@@ -80,6 +92,41 @@ export interface EvaluationResult {
   triggeredIndices: number[];
   winningIndices: number[];
   averageGainPct: number;
+  medianGainPct: number;
+  maxGainPct: number;
+  avgWinGainPct: number;
+  avgMultiplier: number;
+  maxMultiplier: number;
+  avgBarsToPeak: number;
+}
+
+export interface MagnitudeFeatureDriver {
+  label: string;
+  atom: ConditionAtom;
+  hitCount: number;
+  avgGainWhenPresent: number;
+  maxGainWhenPresent: number;
+  avgMultiplier: number;
+  liftVsBaselinePct: number;
+  highMultipleHitRate: number;
+}
+
+export interface MagnitudeProfile {
+  avgGainPct: number;
+  medianGainPct: number;
+  p80GainPct: number;
+  maxGainPct: number;
+  avgMultiplier: number;
+  maxMultiplier: number;
+  highThresholdPct: number;
+  tiers: Array<{
+    label: string;
+    count: number;
+    sharePct: number;
+    avgGainPct: number;
+    avgDurationBars: number;
+  }>;
+  topMagnitudeDrivers: MagnitudeFeatureDriver[];
 }
 
 export interface SupportResistanceStat {

@@ -26,7 +26,7 @@ import {
   buildTradeDisciplineUrl,
   keyLevelToCrossToolParams,
 } from "@/lib/shared-types/interop";
-import { SwingSegment, EvaluationResult } from "@/lib/hindsight/types";
+import { SwingSegment, EvaluationResult, ConditionAtom, MagnitudeProfile } from "@/lib/hindsight/types";
 
 // Dynamic import for Lightweight Charts (no SSR)
 const HindsightChart = dynamic(() => import("@/components/HindsightChart"), {
@@ -46,6 +46,42 @@ const PRESET_SYMBOLS = [
   { label: "丰田汽车", symbol: "7203.T", market: "JP" as MarketCode },
 ];
 
+function medianDuration(swings: SwingSegment[]): number {
+  if (swings.length === 0) return 0;
+  const sorted = swings.map(s => s.durationBars).sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)];
+}
+
+function conditionLabel(cond: ConditionAtom): string {
+  const p = cond.params;
+  switch (cond.type) {
+    case "price_near_ma":
+      return `${p.maKey} ${p.minPct ?? -2.5}%~+${p.maxPct ?? 2.5}%`;
+    case "kdj_zone_or_cross":
+      if (p.mode === "golden_cross") return "KDJ 金叉";
+      if (p.mode === "death_cross") return "KDJ 死叉";
+      return `KDJ: J ${p.mode === "j_above" ? ">" : "<"} ${p.threshold ?? 10}`;
+    case "rsi_zone":
+      return `RSI ${p.mode === "above" ? ">" : "<"} ${p.threshold ?? 35}`;
+    case "macd_state":
+      return { golden_cross: "MACD 金叉", bottom_divergence: "MACD 底背离", top_divergence: "MACD 顶背离", hist_positive: "MACD 红柱" }[String(p.mode)] ?? "MACD";
+    case "volume_ratio":
+      return `量比 ${p.mode === "above" ? ">" : "<"} ${p.threshold ?? 0.8}`;
+    case "candlestick_pattern":
+      return `${p.pattern} 形态`;
+    case "fib_retracement_near":
+      return `斐波那契 ${p.ratio} 附近`;
+    case "vpvr_zone_near":
+      return "筹码峰 POC 附近";
+    case "ma_consecutive_break":
+      return `连续 ${p.days} 天跌破 ${p.maKey}`;
+    case "ma_slope_direction":
+      return `${p.maKey} 斜率${p.direction === "up" ? "向上" : p.direction === "down" ? "向下" : "走平"}`;
+    default:
+      return cond.type;
+  }
+}
+
 export default function HindsightDashboard() {
   const [symbol, setSymbol] = useState("600519");
   const [market, setMarket] = useState<MarketCode>("CN");
@@ -57,21 +93,21 @@ export default function HindsightDashboard() {
   // Analysis result states
   const [payload, setPayload] = useState<HindsightSummaryPayload | null>(null);
   const [swings, setSwings] = useState<SwingSegment[]>([]);
+  const [magnitudeProfile, setMagnitudeProfile] = useState<MagnitudeProfile | null>(null);
   const [candles, setCandles] = useState<Candle[]>([]);
   const [hypothesesResults, setHypothesesResults] = useState<EvaluationResult[]>([]);
   const [selectedRule, setSelectedRule] = useState<EvaluationResult | null>(null);
   const [activeTab, setActiveTab] = useState<"rules" | "swings">("rules");
+  const [swingSort, setSwingSort] = useState<"date" | "gain">("gain");
   const [disciplineUrlModal, setDisciplineUrlModal] = useState<string | null>(null);
-
-  // Initial fetch
-  useEffect(() => {
-    fetchAnalysis();
-  }, []);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [isMock, setIsMock] = useState(false);
 
   const fetchAnalysis = async (customSymbol?: string, customMarket?: MarketCode) => {
     const targetSymbol = customSymbol || symbol;
     const targetMarket = customMarket || market;
     setLoading(true);
+    setErrorMsg(null);
 
     try {
       const url = `/api/hindsight?symbol=${encodeURIComponent(targetSymbol)}&market=${targetMarket}&timeframe=${timeframe}&minSwingPct=${minSwingPct}&years=${lookbackYears}`;
@@ -81,21 +117,29 @@ export default function HindsightDashboard() {
       if (data.success) {
         setPayload(data);
         setSwings(data.swings || []);
+        setMagnitudeProfile(data.magnitudeProfile || null);
         setCandles(data.candles || []);
-        const sortedRules = (data.hypothesesResults || []).sort(
-          (a: EvaluationResult, b: EvaluationResult) => b.winRate - a.winRate
-        );
-        setHypothesesResults(sortedRules);
-        if (sortedRules.length > 0) {
-          setSelectedRule(sortedRules[0]);
-        }
+        setIsMock(Boolean(data.isMock));
+        // Server already ranks by sample reliability then win rate
+        const rules: EvaluationResult[] = data.hypothesesResults || [];
+        setHypothesesResults(rules);
+        setSelectedRule(rules[0] ?? null);
+      } else {
+        setErrorMsg(data.error || "分析失败");
       }
     } catch (err) {
       console.error("Failed to run hindsight analysis:", err);
+      setErrorMsg("网络请求失败，请稍后重试");
     } finally {
       setLoading(false);
     }
   };
+
+  // Initial fetch on mount only
+  useEffect(() => {
+    fetchAnalysis();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const handleSelectPreset = (item: (typeof PRESET_SYMBOLS)[0]) => {
     setSymbol(item.symbol);
@@ -105,7 +149,8 @@ export default function HindsightDashboard() {
 
   const handleOpenDiscipline = (level: HindsightKeyLevel) => {
     if (!payload) return;
-    const crossParams = keyLevelToCrossToolParams(level, payload.symbol, payload.currentPrice);
+    const expectedRebound = magnitudeProfile?.medianGainPct || magnitudeProfile?.avgGainPct;
+    const crossParams = keyLevelToCrossToolParams(level, payload.symbol, payload.currentPrice, expectedRebound);
     const url = buildTradeDisciplineUrl(crossParams, "https://discipline.internal/calculator");
     setDisciplineUrlModal(url);
   };
@@ -123,7 +168,7 @@ export default function HindsightDashboard() {
               <div className="flex items-center gap-2">
                 <h1 className="text-lg font-bold tracking-tight text-white">天台马后炮</h1>
                 <span className="rounded-full bg-slate-800 px-2 py-0.5 text-[10px] font-semibold text-slate-400">
-                  v0.3.0
+                  v0.4.0
                 </span>
                 <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-semibold text-emerald-400 border border-emerald-500/20">
                   拐点共性挖掘
@@ -244,6 +289,16 @@ export default function HindsightDashboard() {
 
       {/* Main Container */}
       <main className="mx-auto max-w-7xl px-4 py-6 sm:px-6">
+        {errorMsg && (
+          <div className="mb-4 rounded-lg border border-rose-800/50 bg-rose-950/40 px-4 py-2.5 text-xs text-rose-300">
+            {errorMsg}
+          </div>
+        )}
+        {isMock && !errorMsg && (
+          <div className="mb-4 rounded-lg border border-amber-800/50 bg-amber-950/40 px-4 py-2.5 text-xs text-amber-300">
+            行情源不可用，当前展示的是合成演示数据，统计结果不代表该标的真实股性。
+          </div>
+        )}
         {/* Top Info Cards */}
         {payload && (
           <div className="mb-6 grid grid-cols-1 gap-4 md:grid-cols-3">
@@ -290,30 +345,43 @@ export default function HindsightDashboard() {
               </div>
             </div>
 
-            {/* 2. Wave Summary */}
+            {/* 2. Wave & Rebound Multiplier Summary */}
             <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4 shadow-lg backdrop-blur-sm">
               <div className="flex items-center justify-between text-xs text-slate-400">
-                <span>历史波段共性统计</span>
-                <span className="text-[11px] text-indigo-400">回溯 {payload.lookbackYears} 年</span>
+                <span>历史反弹幅度与倍率统计</span>
+                <span className="text-[11px] text-indigo-400">回溯 {payload.lookbackYears} 年 · {swings.length} 个波段</span>
               </div>
-              <div className="mt-3 grid grid-cols-2 gap-3">
+              <div className="mt-3 grid grid-cols-3 gap-2.5">
                 <div className="rounded-lg bg-slate-950/60 p-2.5 border border-slate-800">
-                  <div className="text-[11px] text-slate-400">有效上涨波段</div>
-                  <div className="mt-1 text-xl font-bold text-slate-100">{swings.length} 个</div>
-                  <div className="text-[10px] text-slate-400">启动涨幅 &ge; {(minSwingPct * 100).toFixed(0)}%</div>
+                  <div className="text-[11px] text-slate-400">平均反弹</div>
+                  <div className="mt-1 text-lg font-bold text-emerald-400">
+                    +{magnitudeProfile ? magnitudeProfile.avgGainPct.toFixed(1) : "0.0"}%
+                  </div>
+                  <div className="text-[10px] text-slate-400">
+                    倍率 {magnitudeProfile ? `${magnitudeProfile.avgMultiplier.toFixed(2)}x` : "1.00x"}
+                  </div>
                 </div>
                 <div className="rounded-lg bg-slate-950/60 p-2.5 border border-slate-800">
-                  <div className="text-[11px] text-slate-400">波段平均涨幅</div>
-                  <div className="mt-1 text-xl font-bold text-emerald-400">
-                    {swings.length > 0
-                      ? `+${((swings.reduce((a, s) => a + s.gainPct, 0) / swings.length) * 100).toFixed(1)}%`
-                      : "0%"}
+                  <div className="text-[11px] text-slate-400">中位/P80反弹</div>
+                  <div className="mt-1 text-lg font-bold text-sky-400">
+                    +{magnitudeProfile ? magnitudeProfile.medianGainPct.toFixed(1) : "0.0"}%
                   </div>
-                  <div className="text-[10px] text-slate-400">中位持续 {swings.length > 0 ? swings[Math.floor(swings.length / 2)].durationBars : 0} 根K线</div>
+                  <div className="text-[10px] text-slate-400">
+                    P80上限 +{magnitudeProfile ? magnitudeProfile.p80GainPct.toFixed(1) : "0.0"}%
+                  </div>
+                </div>
+                <div className="rounded-lg bg-slate-950/60 p-2.5 border border-slate-800">
+                  <div className="text-[11px] text-slate-400">最大反弹</div>
+                  <div className="mt-1 text-lg font-bold text-amber-400">
+                    +{magnitudeProfile ? magnitudeProfile.maxGainPct.toFixed(1) : "0.0"}%
+                  </div>
+                  <div className="text-[10px] text-slate-400">
+                    最高 {magnitudeProfile ? `${magnitudeProfile.maxMultiplier.toFixed(2)}x` : "1.00x"} · 中位{medianDuration(swings)}根
+                  </div>
                 </div>
               </div>
               <div className="mt-3 text-[11px] text-slate-400">
-                从区域低点启动后，若能守住关键均线，波段平均期望涨幅显著。
+                启动门槛 &ge; {(minSwingPct * 100).toFixed(0)}%，联动纪律时自动按中位反弹幅度测算参考目标止盈位。
               </div>
             </div>
 
@@ -366,6 +434,91 @@ export default function HindsightDashboard() {
               swings={swings}
               selectedRuleResult={selectedRule}
             />
+
+            {/* Rebound Magnitude Distribution & High-Multiple Indicator Drivers */}
+            {magnitudeProfile && swings.length > 0 && (
+              <div className="rounded-xl border border-slate-800 bg-slate-950 p-4 shadow-xl">
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <TrendingUp className="h-4 w-4 text-emerald-400" />
+                    <h3 className="text-sm font-semibold text-slate-200">
+                      反弹倍率分档与底部高空间技术指标画像
+                    </h3>
+                  </div>
+                  <span className="text-xs text-slate-400">
+                    最低点 ±1 根K线出现何种指标特点时，后续反弹倍率最大
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 gap-4 md:grid-cols-5">
+                  {/* Left: 3-tier rebound magnitude distribution */}
+                  <div className="space-y-2.5 md:col-span-2">
+                    <div className="text-xs font-medium text-slate-400">波段反弹幅度分档分布</div>
+                    {magnitudeProfile.tiers.map((tier, tIdx) => (
+                      <div key={tIdx} className="rounded-lg border border-slate-800/80 bg-slate-900/40 p-2.5 text-xs">
+                        <div className="flex items-center justify-between">
+                          <span className="font-medium text-slate-200">{tier.label}</span>
+                          <span className="text-slate-400">
+                            {tier.count} 次 ({tier.sharePct}%)
+                          </span>
+                        </div>
+                        <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
+                          <div
+                            className={`h-full rounded-full ${
+                              tIdx === 2 ? "bg-amber-400" : tIdx === 1 ? "bg-emerald-400" : "bg-sky-400"
+                            }`}
+                            style={{ width: `${Math.min(100, Math.max(4, tier.sharePct))}%` }}
+                          />
+                        </div>
+                        <div className="mt-1.5 flex items-center justify-between text-[11px] text-slate-400">
+                          <span>档内均值: <strong className="text-emerald-400">+{tier.avgGainPct}%</strong></span>
+                          <span>平均耗时: {tier.avgDurationBars} 根K线</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Right: Top indicator features driving large rebounds */}
+                  <div className="md:col-span-3">
+                    <div className="mb-2 text-xs font-medium text-slate-400">
+                      底部启动点指标特点 → 对应反弹幅度与倍率排行
+                    </div>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left text-xs">
+                        <thead>
+                          <tr className="border-b border-slate-800 text-[11px] text-slate-400">
+                            <th className="pb-1.5 font-medium">最低点附近技术指标特点</th>
+                            <th className="pb-1.5 font-medium">出现次数</th>
+                            <th className="pb-1.5 font-medium">平均反弹(倍率)</th>
+                            <th className="pb-1.5 font-medium">最大反弹</th>
+                            <th className="pb-1.5 text-right font-medium">相比均值溢价</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-800/50">
+                          {magnitudeProfile.topMagnitudeDrivers.map((drv, dIdx) => (
+                            <tr key={dIdx} className="hover:bg-slate-900/40">
+                              <td className="py-2 font-medium text-slate-200">{drv.label}</td>
+                              <td className="py-2 text-slate-400">
+                                {drv.hitCount}/{swings.length} 次
+                              </td>
+                              <td className="py-2 font-semibold text-emerald-400">
+                                +{drv.avgGainWhenPresent}% ({drv.avgMultiplier}x)
+                              </td>
+                              <td className="py-2 font-semibold text-amber-400">
+                                +{drv.maxGainWhenPresent}%
+                              </td>
+                              <td className={`py-2 text-right font-medium ${drv.liftVsBaselinePct >= 0 ? "text-emerald-400" : "text-slate-400"}`}>
+                                {drv.liftVsBaselinePct >= 0 ? `+${drv.liftVsBaselinePct}%` : `${drv.liftVsBaselinePct}%`}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
 
             {/* Key Levels Table */}
             {payload && payload.keyLevels.length > 0 && (
@@ -523,24 +676,29 @@ export default function HindsightDashboard() {
                             key={cIdx}
                             className="rounded-md bg-slate-900 px-2 py-0.5 text-[10px] text-slate-300 border border-slate-800"
                           >
-                            {cond.type === "price_near_ma" && `${cond.params.maKey} 均线附近`}
-                            {cond.type === "kdj_zone_or_cross" && `KDJ: J < ${cond.params.threshold || 10}`}
-                            {cond.type === "rsi_zone" && `RSI < ${cond.params.threshold || 35}`}
-                            {cond.type === "macd_state" && `MACD: 金叉/底背离`}
-                            {cond.type === "volume_ratio" && `缩量 20%`}
-                            {cond.type === "candlestick_pattern" && `${cond.params.pattern} 形态`}
+                            {conditionLabel(cond)}
                           </span>
                         ))}
                       </div>
 
                       {/* Stats footer */}
-                      <div className="mt-3 flex items-center justify-between border-t border-slate-800/80 pt-2 text-[11px] text-slate-400">
-                        <span>
-                          触发 {hr.triggerCount} 次 · 达标 {hr.winCount} 次
-                        </span>
-                        <span className="text-slate-400">
-                          基准胜率: {baselinePct}% (超额: +{(hr.winRate * 100 - hr.baselineWinRate * 100).toFixed(1)}%)
-                        </span>
+                      <div className="mt-3 space-y-1 border-t border-slate-800/80 pt-2 text-[11px] text-slate-400">
+                        <div className="flex items-center justify-between">
+                          <span>
+                            触发 {hr.triggerCount} 次 · 达标 {hr.winCount} 次
+                          </span>
+                          <span>
+                            基准胜率: {baselinePct}% (超额: +{(hr.winRate * 100 - hr.baselineWinRate * 100).toFixed(1)}%)
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between text-slate-300">
+                          <span>
+                            平均反弹: <strong className="text-emerald-400">+{hr.averageGainPct}% ({hr.avgMultiplier}x)</strong>
+                          </span>
+                          <span>
+                            最大反弹: <strong className="text-amber-400">+{hr.maxGainPct}% ({hr.maxMultiplier}x)</strong> · 均{hr.avgBarsToPeak}根见顶
+                          </span>
+                        </div>
                       </div>
                     </div>
                   );
@@ -550,33 +708,83 @@ export default function HindsightDashboard() {
 
             {/* Tab 2: Swings Drawer */}
             {activeTab === "swings" && (
-              <div className="space-y-2.5 max-h-[640px] overflow-y-auto pr-1">
-                {swings.map((s, idx) => (
-                  <div
-                    key={`${s.startDate}-${s.peakDate}-${idx}`}
-                    className="rounded-xl border border-slate-800 bg-slate-950 p-3 text-xs"
-                  >
-                    <div className="flex items-center justify-between">
-                      <span className="font-semibold text-slate-200">
-                        波段 #{idx + 1} ({s.startDate} ~ {s.peakDate})
-                      </span>
-                      <span className="rounded bg-emerald-950 px-2 py-0.5 font-bold text-emerald-400 border border-emerald-800/40">
-                        +{(s.gainPct * 100).toFixed(1)}%
-                      </span>
-                    </div>
-                    <div className="mt-2 grid grid-cols-3 gap-2 text-[11px] text-slate-400">
-                      <div>
-                        启动点: <span className="text-slate-200">{s.startPrice.toFixed(2)}</span>
-                      </div>
-                      <div>
-                        波峰点: <span className="text-slate-200">{s.peakPrice.toFixed(2)}</span>
-                      </div>
-                      <div>
-                        持续: <span className="text-slate-200">{s.durationBars} 根K线</span>
-                      </div>
-                    </div>
+              <div className="space-y-2.5">
+                <div className="flex items-center justify-between rounded-lg border border-slate-800 bg-slate-900/50 px-3 py-1.5 text-xs">
+                  <span className="text-slate-400">波段排序方式:</span>
+                  <div className="flex gap-1.5">
+                    <button
+                      onClick={() => setSwingSort("gain")}
+                      className={`rounded px-2 py-0.5 text-[11px] transition-colors ${
+                        swingSort === "gain" ? "bg-indigo-600 text-white font-medium" : "text-slate-400 hover:text-slate-200"
+                      }`}
+                    >
+                      按反弹倍率从高到低
+                    </button>
+                    <button
+                      onClick={() => setSwingSort("date")}
+                      className={`rounded px-2 py-0.5 text-[11px] transition-colors ${
+                        swingSort === "date" ? "bg-indigo-600 text-white font-medium" : "text-slate-400 hover:text-slate-200"
+                      }`}
+                    >
+                      按时间先后
+                    </button>
                   </div>
-                ))}
+                </div>
+                <div className="space-y-2.5 max-h-[600px] overflow-y-auto pr-1">
+                  {[...swings]
+                    .sort((a, b) => (swingSort === "gain" ? b.gainPct - a.gainPct : a.startIndex - b.startIndex))
+                    .map((s, idx) => (
+                      <div
+                        key={`${s.startDate}-${s.peakDate}-${idx}`}
+                        className="rounded-xl border border-slate-800 bg-slate-950 p-3 text-xs"
+                      >
+                        <div className="flex items-center justify-between">
+                          <span className="font-semibold text-slate-200">
+                            #{idx + 1} ({s.startDate} ~ {s.peakDate})
+                          </span>
+                          <span className="rounded bg-emerald-950 px-2 py-0.5 font-bold text-emerald-400 border border-emerald-800/40">
+                            +{s.gainPct.toFixed(1)}% ({(s.multiplier ?? s.peakPrice / s.startPrice).toFixed(2)}x)
+                          </span>
+                        </div>
+                        <div className="mt-2 grid grid-cols-3 gap-2 text-[11px] text-slate-400">
+                          <div>
+                            最低点: <span className="text-slate-200">{s.startPrice.toFixed(2)}</span>
+                          </div>
+                          <div>
+                            波峰点: <span className="text-slate-200">{s.peakPrice.toFixed(2)}</span>
+                          </div>
+                          <div>
+                            持续: <span className="text-slate-200">{s.durationBars} 根K线</span>
+                          </div>
+                        </div>
+                        {s.entryFeatures && (
+                          <div className="mt-2.5 border-t border-slate-800/70 pt-2">
+                            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-400">
+                              <span>最低点指标:</span>
+                              <span>KDJ J=<strong className="text-slate-200">{s.entryFeatures.kdjJ}</strong></span>
+                              <span>RSI=<strong className="text-slate-200">{s.entryFeatures.rsi}</strong></span>
+                              <span>量比=<strong className="text-slate-200">{s.entryFeatures.volumeRatio20}</strong></span>
+                              {s.entryFeatures.nearestMa && (
+                                <span className="text-sky-400">{s.entryFeatures.nearestMa}</span>
+                              )}
+                            </div>
+                            {s.entryFeatures.matchedTags.length > 0 && (
+                              <div className="mt-1.5 flex flex-wrap gap-1">
+                                {s.entryFeatures.matchedTags.map((tag, tIdx) => (
+                                  <span
+                                    key={tIdx}
+                                    className="rounded bg-slate-900 px-1.5 py-0.5 text-[10px] text-indigo-300 border border-slate-800"
+                                  >
+                                    {tag}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                </div>
               </div>
             )}
           </div>

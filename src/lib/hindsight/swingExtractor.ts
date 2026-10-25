@@ -81,6 +81,7 @@ export function extractSwingSegments(
         peakDate: candles[maxHighIdx].date,
         peakPrice: maxHigh,
         gainPct: Number((finalGain * 100).toFixed(2)),
+        multiplier: Number((maxHigh / startLow).toFixed(2)),
         durationBars: maxHighIdx - i,
         isWin: true,
       });
@@ -97,6 +98,7 @@ export function extractSwingSegments(
         peakDate: candles[maxHighIdx].date,
         peakPrice: maxHigh,
         gainPct: Number((finalGain * 100).toFixed(2)),
+        multiplier: Number((maxHigh / startLow).toFixed(2)),
         durationBars: (brokeIdx > 0 ? brokeIdx : maxHighIdx) - i,
         isWin: false,
       });
@@ -141,6 +143,7 @@ export function extractSwingSegments(
         peakDate: candles[minLowIdx].date,
         peakPrice: minLow,
         gainPct: Number((-finalDrop * 100).toFixed(2)),
+        multiplier: Number((minLow / startHigh).toFixed(2)),
         durationBars: minLowIdx - i,
         isWin: true,
       });

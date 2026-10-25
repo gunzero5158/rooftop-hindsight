@@ -18,7 +18,8 @@ export function calculateKeyLevelStats(
   candles: Candle[],
   timeline: TimelineFeatures[],
   levelKey: string,
-  touchTolerancePct: number = 2.5
+  touchTolerancePct: number = 2.5,
+  startIndex: number = 0
 ): SupportResistanceStat {
   const n = candles.length;
   let totalTouches = 0;
@@ -29,7 +30,7 @@ export function calculateKeyLevelStats(
 
   let lastTouchIndex = -10;
 
-  for (let i = 5; i < n - 2; i++) {
+  for (let i = Math.max(5, startIndex); i < n - 2; i++) {
     // Cooldown between touch events
     if (i - lastTouchIndex < 4) continue;
 
@@ -126,13 +127,14 @@ export interface KeyLevelTouchStat {
 
 export function scanAllKeyLevels(
   candles: Candle[],
-  timeline: TimelineFeatures[]
+  timeline: TimelineFeatures[],
+  startIndex: number = 0
 ): KeyLevelTouchStat[] {
   const keys = ["EMA5", "EMA10", "EMA20", "EMA30", "EMA60", "MA5", "MA10", "MA20", "MA30", "MA60"];
   const res: KeyLevelTouchStat[] = [];
 
   for (const k of keys) {
-    const s = calculateKeyLevelStats(candles, timeline, k);
+    const s = calculateKeyLevelStats(candles, timeline, k, 2.5, startIndex);
     if (s.totalTouches > 0) {
       res.push({
         maKey: k,

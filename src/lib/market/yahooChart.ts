@@ -5,11 +5,13 @@ export async function fetchYahooChartCandles(
   rangeYears: number,
   timeframe: "daily" | "weekly"
 ): Promise<Candle[]> {
-  const range = rangeYears >= 5 ? "5y" : rangeYears >= 3 ? "3y" : rangeYears >= 2 ? "2y" : "1y";
+  // Use explicit period window so fractional years (lookback + warmup) are honored
+  const period2 = Math.floor(Date.now() / 1000);
+  const period1 = period2 - Math.ceil(rangeYears * 365.25 * 24 * 3600);
   const interval = timeframe === "weekly" ? "1wk" : "1d";
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
     symbol
-  )}?range=${range}&interval=${interval}`;
+  )}?period1=${period1}&period2=${period2}&interval=${interval}`;
 
   const res = await fetch(url, {
     headers: {
@@ -29,6 +31,8 @@ export async function fetchYahooChartCandles(
   }
 
   const timestamps: number[] = result.timestamp || [];
+  // Exchange-local date: UTC date would shift Asian sessions back by one day
+  const gmtOffset: number = Number(result.meta?.gmtoffset) || 0;
   const quote = result.indicators?.quote?.[0] || {};
   const candles: Candle[] = [];
 
@@ -46,7 +50,7 @@ export async function fetchYahooChartCandles(
       typeof c === "number" &&
       Number.isFinite(c)
     ) {
-      const d = new Date(timestamps[i] * 1000);
+      const d = new Date((timestamps[i] + gmtOffset) * 1000);
       const dateStr = d.toISOString().slice(0, 10);
       candles.push({
         date: dateStr,

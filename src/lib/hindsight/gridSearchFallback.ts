@@ -15,9 +15,9 @@ export function generateLocalHypotheses(
   const hypotheses: HindsightHypothesis[] = [];
 
   // Single atom hypotheses
-  for (const item of topAtoms) {
+  for (const [idx, item] of topAtoms.entries()) {
     hypotheses.push({
-      id: `local_single_${item.atom.type}_${Math.random().toString(36).slice(2, 6)}`,
+      id: `local_single_${idx}_${item.atom.type}`,
       category: "bullish_entry",
       title: item.label,
       conditions: [item.atom],
@@ -89,9 +89,9 @@ export function runLocalGridSearch(
   const hypotheses: HindsightHypothesis[] = [];
 
   // Single atom hypotheses
-  for (const item of topAtoms) {
+  for (const [idx, item] of topAtoms.entries()) {
     hypotheses.push({
-      id: `local_single_${item.atom.type}_${Math.random().toString(36).slice(2, 6)}`,
+      id: `local_single_${idx}_${item.atom.type}`,
       category: "bullish_entry",
       title: item.label,
       conditions: [item.atom],

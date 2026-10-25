@@ -50,11 +50,10 @@ export async function fetchHistoricalCandles(
   // 2. Try Yahoo Chart if EastMoney failed or for US/JP
   if (candles.length < 20) {
     try {
-      const yahooSymbol =
-        symbol.endsWith(".SS") ? symbol.replace(".SS", ".SS") :
-        symbol.endsWith(".SZ") ? symbol.replace(".SZ", ".SZ") :
-        symbol;
-      candles = await fetchYahooChartCandles(yahooSymbol, years + 1, timeframe);
+      // Lookback + warmup span, padded for holidays
+      const barsPerYear = timeframe === "weekly" ? 52 : 250;
+      const rangeYears = (baseBars + warmupBars) / barsPerYear + 0.1;
+      candles = await fetchYahooChartCandles(symbol, rangeYears, timeframe);
     } catch {
       // Fall through to mock if permitted
     }
@@ -71,7 +70,8 @@ export async function fetchHistoricalCandles(
     }
   }
 
-  const sanitized = sanitizeAndProtectCandles(candles);
+  // Hard cap to lookback + warmup in case a source ignores the limit
+  const sanitized = sanitizeAndProtectCandles(candles).slice(-totalLimit);
   if (!isMock) {
     memoryCache.set(cacheKey, { timestamp: Date.now(), candles: sanitized });
   }

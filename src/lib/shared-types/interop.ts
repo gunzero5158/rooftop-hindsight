@@ -119,7 +119,8 @@ export function exportKeyLevel(params: {
 export function keyLevelToCrossToolParams(
   level: HindsightKeyLevel,
   symbol: string,
-  currentPrice?: number
+  currentPrice?: number,
+  expectedReboundPct?: number
 ): CrossToolUrlParams {
   const res: CrossToolUrlParams = {
     symbol,
@@ -128,6 +129,11 @@ export function keyLevelToCrossToolParams(
     suggestedStop: level.suggestedStop ?? Number((level.price * 0.98).toFixed(2)),
     bufferPct: level.bufferPct ?? 2.0,
   };
+
+  if (typeof expectedReboundPct === "number" && expectedReboundPct > 0) {
+    const baseEntry = currentPrice ?? level.price;
+    res.refTarget = Number((baseEntry * (1 + expectedReboundPct / 100)).toFixed(2));
+  }
 
   if (level.indicatorRef?.type === "EMA" || level.indicatorRef?.type === "MA") {
     res.maType = level.indicatorRef.type;

@@ -210,6 +210,10 @@ describe("hypothesisEvaluator", () => {
           cur = lossP;
         }
       }
+      // Flat tail so every trigger has a full 40-bar forward horizon
+      for (let i = 0; i < 10; i++) {
+        candles.push({ date: "2024-01-01", open: cur, high: cur + 0.1, low: cur - 0.1, close: cur, volume: 1000 });
+      }
       return candles;
     }
 
@@ -249,6 +253,10 @@ describe("hypothesisEvaluator", () => {
       }
       cur = winP;
     }
+    // Flat tail so the last trigger has a full 40-bar forward horizon
+    for (let i = 0; i < 10; i++) {
+      candles.push({ date: "2024-01-01", open: cur, high: cur + 0.1, low: cur - 0.1, close: cur, volume: 1000 });
+    }
 
     const timeline = buildFeatureTimeline(candles);
     const hypothesis: HindsightHypothesis = {
@@ -264,5 +272,42 @@ describe("hypothesisEvaluator", () => {
     expect(res.triggerCount).toBe(4);
     expect(res.winRate).toBe(1.0);
     expect(res.status).toBe("insufficient_sample");
+  });
+
+  it("TC-EV-05: Warmup bars and right-censored triggers are excluded from statistics", () => {
+    const hypothesis: HindsightHypothesis = {
+      id: "test_tc_ev_05",
+      category: "bullish_entry",
+      title: "J < 10",
+      conditions: [{ type: "kdj_zone_or_cross", params: { mode: "j_below", threshold: 10 } }],
+      aiRationale: "Censoring test",
+    };
+
+    // 3 winning cycles of 50 bars; the third trigger (bar 111) only has 38 forward bars
+    const candles: Candle[] = [];
+    let cur = 100;
+    for (let c = 0; c < 3; c++) {
+      for (let i = 0; i < 10; i++) {
+        candles.push({ date: "2024-01-01", open: cur, high: cur + 0.1, low: cur - 0.1, close: cur, volume: 1000 });
+      }
+      const p1 = cur - 4;
+      candles.push({ date: "2024-01-01", open: cur, high: cur, low: p1, close: p1, volume: 1000 });
+      const triggerP = cur - 8;
+      candles.push({ date: "2024-01-01", open: p1, high: p1, low: triggerP - 0.5, close: triggerP, volume: 1000 });
+      const winP = Number((triggerP * 1.15).toFixed(2));
+      for (let i = 0; i < 38; i++) {
+        candles.push({ date: "2024-01-01", open: winP, high: winP + 0.1, low: winP - 0.1, close: winP, volume: 1000 });
+      }
+      cur = winP;
+    }
+    const timeline = buildFeatureTimeline(candles);
+
+    // Censored: last trigger (bar 111) cannot be judged with a 40-bar horizon
+    const res = evaluateHypothesis(candles, timeline, hypothesis, { horizonBars: 40 });
+    expect(res.triggeredIndices).toEqual([11, 61]);
+
+    // Warmup: bars before startIndex are not scanned
+    const resWarm = evaluateHypothesis(candles, timeline, hypothesis, { horizonBars: 40, startIndex: 50 });
+    expect(resWarm.triggeredIndices).toEqual([61]);
   });
 });

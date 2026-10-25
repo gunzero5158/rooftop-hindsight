@@ -7,16 +7,19 @@ export interface EvaluatorOptions {
   horizonBars?: number; // default 40
   cooldownBars?: number; // default 5
   minTriggers?: number; // default 8
+  startIndex?: number; // first bar of analysis window (bars before are indicator warmup), default 0
 }
 
 /**
  * Calculates baseline win rate across all eligible bars in the period.
+ * Only bars with a full forward horizon are counted (no right-censoring bias).
  */
 export function calculateBaselineWinRate(
   candles: Candle[],
   minSwingPct: number,
   horizonBars: number,
-  isBullish: boolean = true
+  isBullish: boolean = true,
+  startIndex: number = 0
 ): number {
   const n = candles.length;
   if (n <= horizonBars) return 0.5;
@@ -24,7 +27,7 @@ export function calculateBaselineWinRate(
   let wins = 0;
   let total = 0;
 
-  for (let i = 0; i < n - 5; i++) {
+  for (let i = startIndex; i < n - horizonBars; i++) {
     const startPrice = candles[i].close;
     const maxLookahead = Math.min(n - 1, i + horizonBars);
     let win = false;
@@ -65,13 +68,16 @@ export function evaluateHypothesis(
   const horizonBars = options.horizonBars ?? 40;
   const cooldownBars = options.cooldownBars ?? 5;
   const n = candles.length;
+  const startIndex = Math.max(0, Math.min(options.startIndex ?? 0, n - 1));
+  // Triggers after this bar lack a full forward horizon and cannot be judged yet
+  const lastJudgeableIndex = n - 1 - horizonBars;
 
   const isBullish = hypothesis.category === "bullish_entry" || hypothesis.category === "support_hold";
-  const baselineWinRate = calculateBaselineWinRate(candles, minSwingPct, horizonBars, isBullish);
+  const baselineWinRate = calculateBaselineWinRate(candles, minSwingPct, horizonBars, isBullish, startIndex);
 
   // 1. Scan timeline for raw matches
   const rawHitIndices: number[] = [];
-  for (let i = 0; i < n - 2; i++) {
+  for (let i = startIndex; i <= lastJudgeableIndex; i++) {
     const feat = timeline[i];
     const match = hypothesis.conditions.every(atom => checkAtomCondition(feat, atom));
     if (match) {
@@ -97,17 +103,23 @@ export function evaluateHypothesis(
   // 3. Evaluate each trigger's forward outcome
   const winningIndices: number[] = [];
   const gains: number[] = [];
+  const winGains: number[] = [];
+  const barsToPeaks: number[] = [];
 
   for (const i of triggeredIndices) {
     const startPrice = candles[i].close;
     const maxLookahead = Math.min(n - 1, i + horizonBars);
     let isWin = false;
     let maxGain = 0;
+    let peakOffset = 0;
 
     if (isBullish) {
       let highest = startPrice;
       for (let j = i + 1; j <= maxLookahead; j++) {
-        if (candles[j].high > highest) highest = candles[j].high;
+        if (candles[j].high > highest) {
+          highest = candles[j].high;
+          peakOffset = j - i;
+        }
       }
       maxGain = ((highest - startPrice) / startPrice) * 100;
       if (highest >= startPrice * (1 + minSwingPct)) {
@@ -116,7 +128,10 @@ export function evaluateHypothesis(
     } else {
       let lowest = startPrice;
       for (let j = i + 1; j <= maxLookahead; j++) {
-        if (candles[j].low < lowest) lowest = candles[j].low;
+        if (candles[j].low < lowest) {
+          lowest = candles[j].low;
+          peakOffset = j - i;
+        }
       }
       maxGain = ((startPrice - lowest) / startPrice) * 100;
       if (lowest <= startPrice * (1 - minSwingPct)) {
@@ -125,8 +140,10 @@ export function evaluateHypothesis(
     }
 
     gains.push(maxGain);
+    barsToPeaks.push(peakOffset);
     if (isWin) {
       winningIndices.push(i);
+      winGains.push(maxGain);
     }
   }
 
@@ -135,16 +152,24 @@ export function evaluateHypothesis(
   const winRate = triggerCount > 0 ? Number((winCount / triggerCount).toFixed(3)) : 0;
   const excessWinRate = Number((winRate - baselineWinRate).toFixed(3));
   const avgGain = gains.length > 0 ? Number((gains.reduce((a, b) => a + b, 0) / gains.length).toFixed(2)) : 0;
+  const sortedGains = [...gains].sort((a, b) => a - b);
+  const medianGain = sortedGains.length > 0 ? Number(sortedGains[Math.floor(sortedGains.length / 2)].toFixed(2)) : 0;
+  const maxGain = sortedGains.length > 0 ? Number(sortedGains[sortedGains.length - 1].toFixed(2)) : 0;
+  const avgWinGain = winGains.length > 0 ? Number((winGains.reduce((a, b) => a + b, 0) / winGains.length).toFixed(2)) : 0;
+  const avgMultiplier = Number((1 + avgGain / 100).toFixed(2));
+  const maxMultiplier = Number((1 + maxGain / 100).toFixed(2));
+  const avgBarsToPeak = barsToPeaks.length > 0 ? Math.round(barsToPeaks.reduce((a, b) => a + b, 0) / barsToPeaks.length) : 0;
 
-  // 4. 70/30 In-Sample / Out-of-Sample split (TC-EV-03)
-  const splitIndex = Math.floor(n * 0.7);
+  // 4. 70/30 In-Sample / Out-of-Sample split over the analysis window (TC-EV-03)
+  const splitIndex = startIndex + Math.floor((n - startIndex) * 0.7);
+  const winningSet = new Set(winningIndices);
   let oosTriggerCount = 0;
   let oosWinCount = 0;
 
   for (const idx of triggeredIndices) {
     if (idx >= splitIndex) {
       oosTriggerCount++;
-      if (winningIndices.includes(idx)) {
+      if (winningSet.has(idx)) {
         oosWinCount++;
       }
     }
@@ -162,7 +187,7 @@ export function evaluateHypothesis(
   }
 
   // 5. Sample gate
-  const minRequired = options.minTriggers ?? (n < 200 ? 5 : 8);
+  const minRequired = options.minTriggers ?? (n - startIndex < 200 ? 5 : 8);
   let status: "high_confidence" | "insufficient_sample" | "degraded";
 
   if (triggerCount < minRequired) {
@@ -188,5 +213,11 @@ export function evaluateHypothesis(
     triggeredIndices,
     winningIndices,
     averageGainPct: avgGain,
+    medianGainPct: medianGain,
+    maxGainPct: maxGain,
+    avgWinGainPct: avgWinGain,
+    avgMultiplier,
+    maxMultiplier,
+    avgBarsToPeak,
   };
 }

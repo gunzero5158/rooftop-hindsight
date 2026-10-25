@@ -81,7 +81,8 @@ export async function fetchEastMoneyKlines(
         fields2: "f51,f52,f53,f54,f55,f56",
         klt,
         fqt: "1", // Forward-adjusted QFQ
-        beg: "19900101",
+        // beg=0 makes EastMoney honor lmt and return the latest N bars (a fixed beg date returns full history)
+        beg: "0",
         end: "20991231",
         lmt: String(limit),
         ut: "fa5fd190ac2ec2c49a057690f96c340f",
