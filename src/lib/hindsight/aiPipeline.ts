@@ -1,7 +1,9 @@
 import { Candle, HindsightKeyLevel, HindsightSummaryPayload, MarketCode, TimeframeCode, exportKeyLevel } from "../shared-types/interop";
-import { AtomPreScanResult, buildMagnitudeProfile, checkAtomCondition, enrichSwingsWithFeatures, preScanAllAtoms } from "./univariatePreScan";
+import { AtomPreScanResult, checkAtomCondition, preScanAllAtoms } from "./univariatePreScan";
+import { buildMagnitudeProfile, enrichSwingsWithFeatures } from "./magnitudeProfile";
+import { buildNearTriggers } from "./nearTrigger";
 import { KeyLevelTouchStat, scanAllKeyLevels } from "./keyLevelStats";
-import { ConditionAtom, EvaluationResult, HindsightHypothesis, MagnitudeProfile, SwingSegment } from "./types";
+import { ConditionAtom, EvaluationResult, HindsightHypothesis, MagnitudeProfile, NearTriggerRule, SwingSegment } from "./types";
 import { generateLocalHypotheses } from "./gridSearchFallback";
 import { evaluateHypothesis } from "./hypothesisEvaluator";
 import { extractSwings } from "./swingExtractor";
@@ -245,13 +247,15 @@ const STATUS_RANK: Record<EvaluationResult["status"], number> = {
 };
 
 /**
- * Ranks results: reliable samples first, then win rate, then trigger count.
+ * Ranks results: reliable samples first, then statistically significant over baseline,
+ * then Wilson 95% lower bound, then trigger count.
  */
 export function rankResults(results: EvaluationResult[]): EvaluationResult[] {
   return [...results].sort(
     (a, b) =>
       STATUS_RANK[a.status] - STATUS_RANK[b.status] ||
-      b.winRate - a.winRate ||
+      Number(b.significant) - Number(a.significant) ||
+      b.winRateLowerBound - a.winRateLowerBound ||
       b.triggerCount - a.triggerCount
   );
 }
@@ -273,7 +277,7 @@ export async function runHindsightPipeline(
     apiKey?: string;
     model?: string;
   }
-): Promise<HindsightSummaryPayload & { hypothesesResults: EvaluationResult[]; swings: SwingSegment[]; magnitudeProfile: MagnitudeProfile; analysisStartIndex: number }> {
+): Promise<HindsightSummaryPayload & { hypothesesResults: EvaluationResult[]; swings: SwingSegment[]; magnitudeProfile: MagnitudeProfile; nearTriggers: NearTriggerRule[]; analysisStartIndex: number }> {
   const minSwingPct = options.minSwingPct ?? 0.10;
   const horizonBars = options.horizonBars ?? 40;
   const timeframe = options.timeframe ?? "daily";
@@ -290,7 +294,7 @@ export async function runHindsightPipeline(
   // 2. Statistics & Magnitude / Multiplier Profile
   const keyLevelStats = scanAllKeyLevels(candles, timeline, startIndex);
   const preScanResults = preScanAllAtoms(candles, timeline, swings, minSwingPct, horizonBars, startIndex);
-  const magnitudeProfile = buildMagnitudeProfile(swings, timeline, minSwingPct);
+  const magnitudeProfile = buildMagnitudeProfile(candles, swings, timeline, { minSwingPct, horizonBars, startIndex });
 
   // 3. Generate Hypotheses: local fallback is always generated to ensure stability
   const fallbackHypotheses = generateLocalHypotheses(preScanResults, keyLevelStats);
@@ -347,8 +351,8 @@ export async function runHindsightPipeline(
   const activeSignals: HindsightSummaryPayload["activeSignals"] = [];
   for (const r of results) {
     const isTriggeredNow = r.hypothesis.conditions.every(c => checkAtomCondition(latestFeature, c));
-    // Only reliable rules qualify as an active signal
-    if (isTriggeredNow && r.status !== "insufficient_sample" && r.winRate >= 0.6) {
+    // Only high-confidence rules with statistically significant excess win rate qualify as active signals
+    if (isTriggeredNow && r.status === "high_confidence" && r.significant && r.excessWinRate > 0) {
       activeSignals.push({
         title: r.hypothesis.title,
         category: r.hypothesis.category,
@@ -359,6 +363,8 @@ export async function runHindsightPipeline(
       });
     }
   }
+
+  const nearTriggers = buildNearTriggers(results, latestFeature, 5);
 
   // 6. Synthesize current key levels from strong keyLevelStats
   const keyLevels: HindsightKeyLevel[] = [];
@@ -406,6 +412,7 @@ export async function runHindsightPipeline(
     hypothesesResults: results,
     swings,
     magnitudeProfile,
+    nearTriggers,
     analysisStartIndex: startIndex,
   };
 }

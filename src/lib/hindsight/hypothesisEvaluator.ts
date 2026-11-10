@@ -8,6 +8,38 @@ export interface EvaluatorOptions {
   cooldownBars?: number; // default 5
   minTriggers?: number; // default 8
   startIndex?: number; // first bar of analysis window (bars before are indicator warmup), default 0
+  minOosTriggers?: number; // OOS triggers required before judging validated/degraded, default 4
+}
+
+/**
+ * Wilson score interval lower bound (default 95%). Penalizes high win rates from tiny samples.
+ */
+export function wilsonLowerBound(wins: number, total: number, z: number = 1.96): number {
+  if (total <= 0) return 0;
+  const p = wins / total;
+  const z2 = z * z;
+  const center = p + z2 / (2 * total);
+  const margin = z * Math.sqrt((p * (1 - p)) / total + z2 / (4 * total * total));
+  return Number(Math.max(0, (center - margin) / (1 + z2 / total)).toFixed(3));
+}
+
+/**
+ * One-sided exact binomial tail P(X >= k | n, p0): chance of k+ wins if the rule had only baseline edge.
+ */
+export function binomialUpperTail(k: number, n: number, p0: number): number {
+  if (n <= 0 || k <= 0) return 1;
+  if (k > n) return 0;
+  const p = Math.min(1 - 1e-9, Math.max(1e-9, p0));
+  const logP = Math.log(p);
+  const logQ = Math.log(1 - p);
+  // log C(n, i) built incrementally
+  let logC = 0;
+  let tail = 0;
+  for (let i = 0; i <= n; i++) {
+    if (i > 0) logC += Math.log(n - i + 1) - Math.log(i);
+    if (i >= k) tail += Math.exp(logC + i * logP + (n - i) * logQ);
+  }
+  return Number(Math.min(1, tail).toFixed(4));
 }
 
 /**
@@ -159,6 +191,7 @@ export function evaluateHypothesis(
   const avgMultiplier = Number((1 + avgGain / 100).toFixed(2));
   const maxMultiplier = Number((1 + maxGain / 100).toFixed(2));
   const avgBarsToPeak = barsToPeaks.length > 0 ? Math.round(barsToPeaks.reduce((a, b) => a + b, 0) / barsToPeaks.length) : 0;
+  const pValue = binomialUpperTail(winCount, triggerCount, baselineWinRate);
 
   // 4. 70/30 In-Sample / Out-of-Sample split over the analysis window (TC-EV-03)
   const splitIndex = startIndex + Math.floor((n - startIndex) * 0.7);
@@ -178,7 +211,7 @@ export function evaluateHypothesis(
   const oosWinRate = oosTriggerCount > 0 ? Number((oosWinCount / oosTriggerCount).toFixed(3)) : 0;
   let oosStatus: "oos_validated" | "oos_untested" | "oos_degraded";
 
-  if (oosTriggerCount < 2) {
+  if (oosTriggerCount < (options.minOosTriggers ?? 4)) {
     oosStatus = "oos_untested";
   } else if (oosWinRate >= baselineWinRate) {
     oosStatus = "oos_validated";
@@ -219,5 +252,8 @@ export function evaluateHypothesis(
     avgMultiplier,
     maxMultiplier,
     avgBarsToPeak,
+    winRateLowerBound: wilsonLowerBound(winCount, triggerCount),
+    pValue,
+    significant: pValue < 0.05,
   };
 }

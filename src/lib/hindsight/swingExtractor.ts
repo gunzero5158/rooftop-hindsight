@@ -9,11 +9,18 @@ export interface SwingExtractionResult {
 
 /**
  * Extracts true upward swing segments and failed bounces from historical candles.
+ *
+ * Qualification: from a local valley, price must reach +minSwingPct within `horizonBars`
+ * without first breaking below the valley low.
+ * Structural end (ZigZag): once qualified, the swing keeps tracking new highs until a CLOSE
+ * retraces minSwingPct from the running peak (capped at `maxSwingBars`). This only delimits
+ * the swing for measurement; it is not a stop-loss rule.
  */
 export function extractSwingSegments(
   candles: Candle[],
   minSwingPct: number = 0.10,
-  horizonBars: number = 40
+  horizonBars: number = 40,
+  maxSwingBars: number = 250
 ): SwingExtractionResult {
   const successfulSwings: SwingSegment[] = [];
   const failedRebounds: SwingSegment[] = [];
@@ -46,62 +53,63 @@ export function extractSwingSegments(
     }
 
     const startLow = candles[i].low;
-    const maxLookahead = Math.min(n - 1, i + horizonBars);
+    const hardEnd = Math.min(n - 1, i + maxSwingBars);
+    const qualifyTarget = startLow * (1 + minSwingPct);
 
-    let maxHigh = startLow;
-    let maxHighIdx = i;
-    let brokeBelowStart = false;
+    let peak = startLow;
+    let peakIdx = i;
+    let qualified = false;
     let brokeIdx = -1;
+    let ended = false;
 
-    for (let j = i + 1; j <= maxLookahead; j++) {
-      if (candles[j].high > maxHigh) {
-        maxHigh = candles[j].high;
-        maxHighIdx = j;
+    for (let j = i + 1; j <= hardEnd; j++) {
+      if (!qualified && j > i + horizonBars) break; // Failed to qualify in time
+
+      if (candles[j].high > peak) {
+        peak = candles[j].high;
+        peakIdx = j;
       }
 
-      // Check if price breaks below startup low before hitting the target
-      if (candles[j].low < startLow) {
-        const currentGain = (maxHigh - startLow) / startLow;
-        if (currentGain < minSwingPct) {
-          brokeBelowStart = true;
+      if (!qualified) {
+        if (peak >= qualifyTarget) {
+          qualified = true;
+        } else if (candles[j].low < startLow) {
           brokeIdx = j;
           break;
         }
       }
+
+      // Structural end: close retraces minSwingPct from the running peak
+      if (qualified && j > peakIdx && candles[j].close <= peak * (1 - minSwingPct)) {
+        ended = true;
+        break;
+      }
     }
 
-    const finalGain = (maxHigh - startLow) / startLow;
+    const finalGain = (peak - startLow) / startLow;
+    const segment: SwingSegment = {
+      startIndex: i,
+      startDate: candles[i].date,
+      startPrice: startLow,
+      peakIndex: peakIdx,
+      peakDate: candles[peakIdx].date,
+      peakPrice: peak,
+      gainPct: Number((finalGain * 100).toFixed(2)),
+      closeGainPct: Number((((peak - candles[i].close) / candles[i].close) * 100).toFixed(2)),
+      multiplier: Number((peak / startLow).toFixed(2)),
+      durationBars: peakIdx - i,
+      isWin: qualified,
+    };
 
-    if (finalGain >= minSwingPct && !brokeBelowStart) {
-      successfulSwings.push({
-        startIndex: i,
-        startDate: candles[i].date,
-        startPrice: startLow,
-        peakIndex: maxHighIdx,
-        peakDate: candles[maxHighIdx].date,
-        peakPrice: maxHigh,
-        gainPct: Number((finalGain * 100).toFixed(2)),
-        multiplier: Number((maxHigh / startLow).toFixed(2)),
-        durationBars: maxHighIdx - i,
-        isWin: true,
-      });
-
+    if (qualified) {
+      // Not ended and window reached the last bar => swing still in progress
+      segment.ongoing = !ended && hardEnd === n - 1;
+      successfulSwings.push(segment);
       // Cover intermediate dips up to the peak (preventing 100 -> 104 -> 101 -> 113 duplicate triggers)
-      lastCoveredIndex = maxHighIdx;
+      lastCoveredIndex = peakIdx;
     } else {
-      // Failed rebound
-      failedRebounds.push({
-        startIndex: i,
-        startDate: candles[i].date,
-        startPrice: startLow,
-        peakIndex: maxHighIdx,
-        peakDate: candles[maxHighIdx].date,
-        peakPrice: maxHigh,
-        gainPct: Number((finalGain * 100).toFixed(2)),
-        multiplier: Number((maxHigh / startLow).toFixed(2)),
-        durationBars: (brokeIdx > 0 ? brokeIdx : maxHighIdx) - i,
-        isWin: false,
-      });
+      segment.durationBars = (brokeIdx > 0 ? brokeIdx : peakIdx) - i;
+      failedRebounds.push(segment);
     }
   }
 

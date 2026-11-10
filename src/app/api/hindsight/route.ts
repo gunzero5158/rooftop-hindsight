@@ -20,7 +20,7 @@ export async function GET(req: NextRequest) {
     const market: MarketCode = rawMarket && MARKETS.includes(rawMarket) ? rawMarket : detectMarket(symbol);
     const timeframe: TimeframeCode = searchParams.get("timeframe") === "weekly" ? "weekly" : "daily";
     const minSwingPct = clampNumber(searchParams.get("minSwingPct"), 0.10, 0.03, 0.5);
-    const years = clampNumber(searchParams.get("years"), 3, 1, 5);
+    const years = clampNumber(searchParams.get("years"), 5, 1, 5);
     // Weekly warmup in weeks keeps the same ~1 year of indicator stabilization
     const warmupBars = timeframe === "weekly" ? 52 : WARMUP_BARS;
 

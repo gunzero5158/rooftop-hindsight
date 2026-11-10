@@ -26,7 +26,8 @@ import {
   buildTradeDisciplineUrl,
   keyLevelToCrossToolParams,
 } from "@/lib/shared-types/interop";
-import { SwingSegment, EvaluationResult, ConditionAtom, MagnitudeProfile } from "@/lib/hindsight/types";
+import { SwingSegment, EvaluationResult, MagnitudeProfile, NearTriggerRule } from "@/lib/hindsight/types";
+import { conditionLabel } from "@/lib/hindsight/conditionLabel";
 
 // Dynamic import for Lightweight Charts (no SSR)
 const HindsightChart = dynamic(() => import("@/components/HindsightChart"), {
@@ -52,48 +53,19 @@ function medianDuration(swings: SwingSegment[]): number {
   return sorted[Math.floor(sorted.length / 2)];
 }
 
-function conditionLabel(cond: ConditionAtom): string {
-  const p = cond.params;
-  switch (cond.type) {
-    case "price_near_ma":
-      return `${p.maKey} ${p.minPct ?? -2.5}%~+${p.maxPct ?? 2.5}%`;
-    case "kdj_zone_or_cross":
-      if (p.mode === "golden_cross") return "KDJ 金叉";
-      if (p.mode === "death_cross") return "KDJ 死叉";
-      return `KDJ: J ${p.mode === "j_above" ? ">" : "<"} ${p.threshold ?? 10}`;
-    case "rsi_zone":
-      return `RSI ${p.mode === "above" ? ">" : "<"} ${p.threshold ?? 35}`;
-    case "macd_state":
-      return { golden_cross: "MACD 金叉", bottom_divergence: "MACD 底背离", top_divergence: "MACD 顶背离", hist_positive: "MACD 红柱" }[String(p.mode)] ?? "MACD";
-    case "volume_ratio":
-      return `量比 ${p.mode === "above" ? ">" : "<"} ${p.threshold ?? 0.8}`;
-    case "candlestick_pattern":
-      return `${p.pattern} 形态`;
-    case "fib_retracement_near":
-      return `斐波那契 ${p.ratio} 附近`;
-    case "vpvr_zone_near":
-      return "筹码峰 POC 附近";
-    case "ma_consecutive_break":
-      return `连续 ${p.days} 天跌破 ${p.maKey}`;
-    case "ma_slope_direction":
-      return `${p.maKey} 斜率${p.direction === "up" ? "向上" : p.direction === "down" ? "向下" : "走平"}`;
-    default:
-      return cond.type;
-  }
-}
-
 export default function HindsightDashboard() {
   const [symbol, setSymbol] = useState("600519");
   const [market, setMarket] = useState<MarketCode>("CN");
   const [timeframe, setTimeframe] = useState<TimeframeCode>("daily");
   const [minSwingPct, setMinSwingPct] = useState(0.10);
-  const [lookbackYears, setLookbackYears] = useState(3);
+  const [lookbackYears, setLookbackYears] = useState(5);
   const [loading, setLoading] = useState(false);
 
   // Analysis result states
   const [payload, setPayload] = useState<HindsightSummaryPayload | null>(null);
   const [swings, setSwings] = useState<SwingSegment[]>([]);
   const [magnitudeProfile, setMagnitudeProfile] = useState<MagnitudeProfile | null>(null);
+  const [nearTriggers, setNearTriggers] = useState<NearTriggerRule[]>([]);
   const [candles, setCandles] = useState<Candle[]>([]);
   const [hypothesesResults, setHypothesesResults] = useState<EvaluationResult[]>([]);
   const [selectedRule, setSelectedRule] = useState<EvaluationResult | null>(null);
@@ -118,9 +90,10 @@ export default function HindsightDashboard() {
         setPayload(data);
         setSwings(data.swings || []);
         setMagnitudeProfile(data.magnitudeProfile || null);
+        setNearTriggers(data.nearTriggers || []);
         setCandles(data.candles || []);
         setIsMock(Boolean(data.isMock));
-        // Server already ranks by sample reliability then win rate
+        // Server already ranks by sample reliability, significance, and Wilson lower bound
         const rules: EvaluationResult[] = data.hypothesesResults || [];
         setHypothesesResults(rules);
         setSelectedRule(rules[0] ?? null);
@@ -149,7 +122,11 @@ export default function HindsightDashboard() {
 
   const handleOpenDiscipline = (level: HindsightKeyLevel) => {
     if (!payload) return;
-    const expectedRebound = magnitudeProfile?.medianGainPct || magnitudeProfile?.avgGainPct;
+    // Prefer close-caliber or selected rule's median gain so target price reflects tradable entry
+    const expectedRebound =
+      selectedRule?.medianGainPct ||
+      magnitudeProfile?.medianCloseGainPct ||
+      magnitudeProfile?.medianGainPct;
     const crossParams = keyLevelToCrossToolParams(level, payload.symbol, payload.currentPrice, expectedRebound);
     const url = buildTradeDisciplineUrl(crossParams, "https://discipline.internal/calculator");
     setDisciplineUrlModal(url);
@@ -168,7 +145,7 @@ export default function HindsightDashboard() {
               <div className="flex items-center gap-2">
                 <h1 className="text-lg font-bold tracking-tight text-white">天台马后炮</h1>
                 <span className="rounded-full bg-slate-800 px-2 py-0.5 text-[10px] font-semibold text-slate-400">
-                  v0.4.0
+                  v0.5.0
                 </span>
                 <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-semibold text-emerald-400 border border-emerald-500/20">
                   拐点共性挖掘
@@ -269,8 +246,8 @@ export default function HindsightDashboard() {
                 >
                   <option value={1} className="bg-slate-900">近 1 年</option>
                   <option value={2} className="bg-slate-900">近 2 年</option>
-                  <option value={3} className="bg-slate-900">近 3 年 (推荐)</option>
-                  <option value={5} className="bg-slate-900">近 5 年</option>
+                  <option value={3} className="bg-slate-900">近 3 年</option>
+                  <option value={5} className="bg-slate-900">近 5 年 (推荐)</option>
                 </select>
               </div>
             </div>
@@ -297,6 +274,11 @@ export default function HindsightDashboard() {
         {isMock && !errorMsg && (
           <div className="mb-4 rounded-lg border border-amber-800/50 bg-amber-950/40 px-4 py-2.5 text-xs text-amber-300">
             行情源不可用，当前展示的是合成演示数据，统计结果不代表该标的真实股性。
+          </div>
+        )}
+        {magnitudeProfile?.lowSampleWarning && !errorMsg && (
+          <div className="mb-4 rounded-lg border border-amber-800/40 bg-amber-950/30 px-4 py-2 text-xs text-amber-200">
+            样本量提示：当前回溯期内有效波段仅 {magnitudeProfile.sampleCount} 个（少于 15 个统计稳健阈值），分位数与归因结论仅供参考，建议拉长回溯年限或降低启动涨幅门槛。
           </div>
         )}
         {/* Top Info Cards */}
@@ -349,39 +331,42 @@ export default function HindsightDashboard() {
             <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4 shadow-lg backdrop-blur-sm">
               <div className="flex items-center justify-between text-xs text-slate-400">
                 <span>历史反弹幅度与倍率统计</span>
-                <span className="text-[11px] text-indigo-400">回溯 {payload.lookbackYears} 年 · {swings.length} 个波段</span>
+                <span className="text-[11px] text-indigo-400">
+                  回溯 {payload.lookbackYears} 年 · {swings.length} 个波段
+                  {magnitudeProfile && magnitudeProfile.ongoingCount > 0 ? ` (${magnitudeProfile.ongoingCount}进行中)` : ""}
+                </span>
               </div>
               <div className="mt-3 grid grid-cols-3 gap-2.5">
                 <div className="rounded-lg bg-slate-950/60 p-2.5 border border-slate-800">
-                  <div className="text-[11px] text-slate-400">平均反弹</div>
+                  <div className="text-[11px] text-slate-400">中位反弹 (最低点)</div>
                   <div className="mt-1 text-lg font-bold text-emerald-400">
-                    +{magnitudeProfile ? magnitudeProfile.avgGainPct.toFixed(1) : "0.0"}%
-                  </div>
-                  <div className="text-[10px] text-slate-400">
-                    倍率 {magnitudeProfile ? `${magnitudeProfile.avgMultiplier.toFixed(2)}x` : "1.00x"}
-                  </div>
-                </div>
-                <div className="rounded-lg bg-slate-950/60 p-2.5 border border-slate-800">
-                  <div className="text-[11px] text-slate-400">中位/P80反弹</div>
-                  <div className="mt-1 text-lg font-bold text-sky-400">
                     +{magnitudeProfile ? magnitudeProfile.medianGainPct.toFixed(1) : "0.0"}%
                   </div>
                   <div className="text-[10px] text-slate-400">
-                    P80上限 +{magnitudeProfile ? magnitudeProfile.p80GainPct.toFixed(1) : "0.0"}%
+                    均值 +{magnitudeProfile ? magnitudeProfile.avgGainPct.toFixed(1) : "0.0"}% ({magnitudeProfile ? `${magnitudeProfile.avgMultiplier.toFixed(2)}x` : "1.00x"})
                   </div>
                 </div>
                 <div className="rounded-lg bg-slate-950/60 p-2.5 border border-slate-800">
-                  <div className="text-[11px] text-slate-400">最大反弹</div>
-                  <div className="mt-1 text-lg font-bold text-amber-400">
-                    +{magnitudeProfile ? magnitudeProfile.maxGainPct.toFixed(1) : "0.0"}%
+                  <div className="text-[11px] text-slate-400">收盘口径 (可交易)</div>
+                  <div className="mt-1 text-lg font-bold text-sky-400">
+                    +{magnitudeProfile ? magnitudeProfile.medianCloseGainPct.toFixed(1) : "0.0"}%
                   </div>
                   <div className="text-[10px] text-slate-400">
-                    最高 {magnitudeProfile ? `${magnitudeProfile.maxMultiplier.toFixed(2)}x` : "1.00x"} · 中位{medianDuration(swings)}根
+                    P80 +{magnitudeProfile ? magnitudeProfile.p80CloseGainPct.toFixed(1) : "0.0"}% · 均值 +{magnitudeProfile ? magnitudeProfile.avgCloseGainPct.toFixed(1) : "0.0"}%
+                  </div>
+                </div>
+                <div className="rounded-lg bg-slate-950/60 p-2.5 border border-slate-800">
+                  <div className="text-[11px] text-slate-400">P80 / 极值上限</div>
+                  <div className="mt-1 text-lg font-bold text-amber-400">
+                    +{magnitudeProfile ? magnitudeProfile.p80GainPct.toFixed(1) : "0.0"}%
+                  </div>
+                  <div className="text-[10px] text-slate-400">
+                    极值 +{magnitudeProfile ? magnitudeProfile.maxGainPct.toFixed(1) : "0.0"}% · 中位{medianDuration(swings)}根
                   </div>
                 </div>
               </div>
               <div className="mt-3 text-[11px] text-slate-400">
-                启动门槛 &ge; {(minSwingPct * 100).toFixed(0)}%，联动纪律时自动按中位反弹幅度测算参考目标止盈位。
+                启动门槛 &ge; {(minSwingPct * 100).toFixed(0)}%，联动纪律默认采用可交易的<strong>收盘口径/选中规则中位涨幅</strong>测算目标止盈位。
               </div>
             </div>
 
@@ -480,32 +465,35 @@ export default function HindsightDashboard() {
 
                   {/* Right: Top indicator features driving large rebounds */}
                   <div className="md:col-span-3">
-                    <div className="mb-2 text-xs font-medium text-slate-400">
-                      底部启动点指标特点 → 对应反弹幅度与倍率排行
+                    <div className="mb-2 flex items-center justify-between text-xs font-medium text-slate-400">
+                      <span>全量历史信号归因（消除幸存者偏差 · 收盘买入前瞻口径）</span>
+                      <span className="text-[11px] text-slate-500">
+                        全市场基准均值: +{magnitudeProfile.baselineForwardGainPct}%
+                      </span>
                     </div>
                     <div className="overflow-x-auto">
                       <table className="w-full text-left text-xs">
                         <thead>
                           <tr className="border-b border-slate-800 text-[11px] text-slate-400">
-                            <th className="pb-1.5 font-medium">最低点附近技术指标特点</th>
-                            <th className="pb-1.5 font-medium">出现次数</th>
-                            <th className="pb-1.5 font-medium">平均反弹(倍率)</th>
-                            <th className="pb-1.5 font-medium">最大反弹</th>
-                            <th className="pb-1.5 text-right font-medium">相比均值溢价</th>
+                            <th className="pb-1.5 font-medium">技术指标特点</th>
+                            <th className="pb-1.5 font-medium">全量触发/胜率</th>
+                            <th className="pb-1.5 font-medium">前瞻中位/均值</th>
+                            <th className="pb-1.5 font-medium">波段画像命中</th>
+                            <th className="pb-1.5 text-right font-medium">相比基准溢价</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-800/50">
                           {magnitudeProfile.topMagnitudeDrivers.map((drv, dIdx) => (
                             <tr key={dIdx} className="hover:bg-slate-900/40">
                               <td className="py-2 font-medium text-slate-200">{drv.label}</td>
-                              <td className="py-2 text-slate-400">
-                                {drv.hitCount}/{swings.length} 次
+                              <td className="py-2 text-slate-300">
+                                {drv.occurrenceCount}次 ({(drv.winRate * 100).toFixed(0)}%)
                               </td>
                               <td className="py-2 font-semibold text-emerald-400">
-                                +{drv.avgGainWhenPresent}% ({drv.avgMultiplier}x)
+                                +{drv.medianForwardGainPct}% / +{drv.avgForwardGainPct}% ({(1 + drv.avgForwardGainPct / 100).toFixed(2)}x)
                               </td>
-                              <td className="py-2 font-semibold text-amber-400">
-                                +{drv.maxGainWhenPresent}%
+                              <td className="py-2 text-slate-400">
+                                {drv.swingHitCount}/{swings.length} 波段 (+{drv.avgSwingGainWhenPresent}%)
                               </td>
                               <td className={`py-2 text-right font-medium ${drv.liftVsBaselinePct >= 0 ? "text-emerald-400" : "text-slate-400"}`}>
                                 {drv.liftVsBaselinePct >= 0 ? `+${drv.liftVsBaselinePct}%` : `${drv.liftVsBaselinePct}%`}
@@ -588,6 +576,47 @@ export default function HindsightDashboard() {
 
           {/* Right Col: Leaderboard & Swings Drawer */}
           <div className="space-y-4">
+            {/* Near-Trigger Proximity Radar */}
+            {nearTriggers.length > 0 && (
+              <div className="rounded-xl border border-slate-800 bg-slate-950 p-3.5 shadow-lg">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-semibold text-slate-200">临近触发监控 (最新K线距离)</span>
+                  <span className="text-[10px] text-slate-400">按条件接近度排序</span>
+                </div>
+                <div className="mt-2.5 space-y-2">
+                  {nearTriggers.slice(0, 3).map((nt, nIdx) => (
+                    <div
+                      key={nt.ruleId || nIdx}
+                      className="rounded-lg border border-slate-800/80 bg-slate-900/50 p-2.5 text-xs"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-medium text-slate-200 truncate">{nt.title}</span>
+                        <span
+                          className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold ${
+                            nt.satisfiedCount === nt.totalConditions
+                              ? "bg-emerald-950 text-emerald-400 border border-emerald-800/50"
+                              : "bg-indigo-950/70 text-indigo-300 border border-indigo-800/40"
+                          }`}
+                        >
+                          已满足 {nt.satisfiedCount}/{nt.totalConditions} · 接近度 {(nt.closeness * 100).toFixed(0)}%
+                        </span>
+                      </div>
+                      <div className="mt-1.5 space-y-1">
+                        {nt.conditions.map((c, cIdx) => (
+                          <div key={cIdx} className="flex items-center justify-between text-[11px]">
+                            <span className="text-slate-400">{c.label} ({c.current})</span>
+                            <span className={c.satisfied ? "text-emerald-400 font-medium" : "text-amber-300"}>
+                              {c.gapText}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {/* Tabs */}
             <div className="flex rounded-xl border border-slate-800 bg-slate-950 p-1">
               <button
@@ -634,10 +663,20 @@ export default function HindsightDashboard() {
                     >
                       <div className="flex items-start justify-between gap-2">
                         <div>
-                          <div className="flex items-center gap-2">
+                          <div className="flex flex-wrap items-center gap-1.5">
                             <span className="font-semibold text-slate-100 text-xs sm:text-sm">
                               {hr.hypothesis.title}
                             </span>
+                            {/* Significance Badge */}
+                            {hr.significant ? (
+                              <span className="rounded bg-indigo-950 px-1.5 py-0.5 text-[10px] font-medium text-indigo-300 border border-indigo-800/50">
+                                显著 p={hr.pValue.toFixed(3)}
+                              </span>
+                            ) : (
+                              <span className="rounded bg-slate-900 px-1.5 py-0.5 text-[10px] font-medium text-slate-500 border border-slate-800">
+                                p={hr.pValue.toFixed(2)}
+                              </span>
+                            )}
                             {/* OOS Badge */}
                             {hr.oosStatus === "oos_validated" && (
                               <span className="rounded bg-emerald-950 px-1.5 py-0.5 text-[10px] font-medium text-emerald-400 border border-emerald-800/40">
@@ -651,7 +690,7 @@ export default function HindsightDashboard() {
                             )}
                             {hr.oosStatus === "oos_untested" && (
                               <span className="rounded bg-slate-800 px-1.5 py-0.5 text-[10px] font-medium text-slate-400">
-                                样本外未触发
+                                样本外待验
                               </span>
                             )}
                           </div>
@@ -661,11 +700,13 @@ export default function HindsightDashboard() {
                             </p>
                           )}
                         </div>
-                        <div className="text-right">
+                        <div className="text-right shrink-0">
                           <div className="text-lg font-extrabold text-amber-400">
                             {winRatePct}%
                           </div>
-                          <div className="text-[10px] text-slate-400">胜率</div>
+                          <div className="text-[10px] text-slate-400">
+                            下限 {(hr.winRateLowerBound * 100).toFixed(0)}%
+                          </div>
                         </div>
                       </div>
 
@@ -693,10 +734,10 @@ export default function HindsightDashboard() {
                         </div>
                         <div className="flex items-center justify-between text-slate-300">
                           <span>
-                            平均反弹: <strong className="text-emerald-400">+{hr.averageGainPct}% ({hr.avgMultiplier}x)</strong>
+                            中位/均值: <strong className="text-emerald-400">+{hr.medianGainPct}% / +{hr.averageGainPct}% ({hr.avgMultiplier}x)</strong>
                           </span>
                           <span>
-                            最大反弹: <strong className="text-amber-400">+{hr.maxGainPct}% ({hr.maxMultiplier}x)</strong> · 均{hr.avgBarsToPeak}根见顶
+                            极值: <strong className="text-amber-400">+{hr.maxGainPct}%</strong> · 均{hr.avgBarsToPeak}根见顶
                           </span>
                         </div>
                       </div>
@@ -739,8 +780,13 @@ export default function HindsightDashboard() {
                         className="rounded-xl border border-slate-800 bg-slate-950 p-3 text-xs"
                       >
                         <div className="flex items-center justify-between">
-                          <span className="font-semibold text-slate-200">
-                            #{idx + 1} ({s.startDate} ~ {s.peakDate})
+                          <span className="font-semibold text-slate-200 flex items-center gap-1.5">
+                            <span>#{idx + 1} ({s.startDate} ~ {s.peakDate})</span>
+                            {s.ongoing && (
+                              <span className="rounded bg-amber-950 px-1.5 py-0.5 text-[10px] text-amber-300 border border-amber-800/50">
+                                进行中
+                              </span>
+                            )}
                           </span>
                           <span className="rounded bg-emerald-950 px-2 py-0.5 font-bold text-emerald-400 border border-emerald-800/40">
                             +{s.gainPct.toFixed(1)}% ({(s.multiplier ?? s.peakPrice / s.startPrice).toFixed(2)}x)
@@ -748,10 +794,10 @@ export default function HindsightDashboard() {
                         </div>
                         <div className="mt-2 grid grid-cols-3 gap-2 text-[11px] text-slate-400">
                           <div>
-                            最低点: <span className="text-slate-200">{s.startPrice.toFixed(2)}</span>
+                            最低/波峰: <span className="text-slate-200">{s.startPrice.toFixed(2)} → {s.peakPrice.toFixed(2)}</span>
                           </div>
                           <div>
-                            波峰点: <span className="text-slate-200">{s.peakPrice.toFixed(2)}</span>
+                            收盘口径: <span className="text-sky-400">+{s.closeGainPct !== undefined ? s.closeGainPct.toFixed(1) : s.gainPct.toFixed(1)}%</span>
                           </div>
                           <div>
                             持续: <span className="text-slate-200">{s.durationBars} 根K线</span>

@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { Candle } from "@/lib/shared-types/interop";
 import { extractSwingSegments } from "../swingExtractor";
 import { buildFeatureTimeline } from "../featureTimeline";
-import { buildMagnitudeProfile, enrichSwingsWithFeatures } from "../univariatePreScan";
+import { buildMagnitudeProfile, enrichSwingsWithFeatures } from "../magnitudeProfile";
 
 function createFlatCandles(count: number, basePrice: number = 100): Candle[] {
   const candles: Candle[] = [];
@@ -138,20 +138,54 @@ describe("swingExtractor", () => {
     const timeline = buildFeatureTimeline(candles);
     const { successfulSwings } = extractSwingSegments(candles, 0.10, 30);
     const enriched = enrichSwingsWithFeatures(successfulSwings, timeline);
-    const profile = buildMagnitudeProfile(enriched, timeline, 0.10);
+    const profile = buildMagnitudeProfile(candles, enriched, timeline, { minSwingPct: 0.10, horizonBars: 30 });
 
     expect(enriched.length).toBe(3);
     expect(enriched[0].multiplier).toBe(1.4);
+    expect(enriched[0].closeGainPct).toBeCloseTo(((133 - 96) / 96) * 100, 1);
     expect(enriched[0].entryFeatures).toBeDefined();
     expect(enriched[0].entryFeatures!.volumeRatio20).toBeLessThan(0.5);
 
     expect(profile.maxGainPct).toBe(40);
     expect(profile.maxMultiplier).toBe(1.4);
     expect(profile.avgGainPct).toBeCloseTo(27.33, 1);
+    expect(profile.lowSampleWarning).toBe(true);
 
     const volDriver = profile.topMagnitudeDrivers.find(d => d.atom.type === "volume_ratio");
     expect(volDriver).toBeDefined();
-    expect(volDriver!.avgGainWhenPresent).toBe(35);
+    expect(volDriver!.occurrenceCount).toBeGreaterThanOrEqual(2);
+    expect(volDriver!.avgSwingGainWhenPresent).toBe(35);
     expect(volDriver!.liftVsBaselinePct).toBeGreaterThan(5);
+  });
+
+  it("TC-SW-06: Structural ZigZag swing extends past horizonBars until minSwingPct close retracement", () => {
+    const candles = createFlatCandles(150, 105);
+
+    candles[9] = { ...candles[9], low: 102, close: 103 };
+    // Bar 10: valley low = 100, close = 101
+    candles[10] = { ...candles[10], open: 101, high: 102, low: 100.0, close: 101.0 };
+
+    // Qualifies within 30 bars (+15% by bar 25) and keeps climbing until bar 60 (past horizonBars=30)
+    for (let i = 11; i <= 60; i++) {
+      const price = 101 + (i - 10) * 1.0; // reaches 151 at bar 60
+      candles[i] = { ...candles[i], open: price - 0.5, high: price + 1, low: price - 1, close: price };
+    }
+    // Bar 60: peak high = 160.0 (+60% from low 100, +58.42% from close 101)
+    candles[60] = { ...candles[60], open: 155, high: 160.0, low: 154, close: 158 };
+
+    // Bar 65: close retraces > 10% from peak 160 (close = 140 <= 160 * 0.9 = 144)
+    for (let i = 61; i < 65; i++) {
+      candles[i] = { ...candles[i], open: 152, high: 153, low: 148, close: 150 };
+    }
+    candles[65] = { ...candles[65], open: 145, high: 146, low: 139, close: 140 };
+
+    const { successfulSwings } = extractSwingSegments(candles, 0.10, 30);
+    const swing = successfulSwings.find(s => s.startIndex === 10);
+    expect(swing).toBeDefined();
+    expect(swing!.peakIndex).toBe(60);
+    expect(swing!.peakPrice).toBe(160.0);
+    expect(swing!.gainPct).toBe(60.0);
+    expect(swing!.closeGainPct).toBeCloseTo(58.42, 1);
+    expect(swing!.ongoing).toBe(false);
   });
 });

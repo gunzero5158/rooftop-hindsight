@@ -1,7 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { Candle } from "@/lib/shared-types/interop";
 import { buildFeatureTimeline } from "../featureTimeline";
-import { evaluateHypothesis } from "../hypothesisEvaluator";
+import { evaluateHypothesis, wilsonLowerBound, binomialUpperTail } from "../hypothesisEvaluator";
+import { buildNearTriggers } from "../nearTrigger";
 import { HindsightHypothesis } from "../types";
 
 function createCandles(count: number, basePrice: number = 100): Candle[] {
@@ -225,14 +226,18 @@ describe("hypothesisEvaluator", () => {
     expect(resA.oosTriggerCount).toBe(0);
     expect(resA.oosStatus).toBe("oos_untested");
 
-    // Scenario B: >= 2 triggers in OOS, all lose
+    // Scenario B: 2 triggers in OOS are flagged oos_untested under default minOosTriggers=4,
+    // and oos_degraded when minOosTriggers=2 is explicitly requested
     const candlesB = buildSequence(true);
     const timelineB = buildFeatureTimeline(candlesB);
-    const resB = evaluateHypothesis(candlesB, timelineB, hypothesis, { minSwingPct: 0.10 });
+    const resBDefault = evaluateHypothesis(candlesB, timelineB, hypothesis, { minSwingPct: 0.10 });
+    expect(resBDefault.oosTriggerCount).toBe(2);
+    expect(resBDefault.oosStatus).toBe("oos_untested");
 
-    expect(resB.oosTriggerCount).toBeGreaterThanOrEqual(2);
-    expect(resB.oosWinRate).toBe(0);
-    expect(resB.oosStatus).toBe("oos_degraded");
+    const resB2 = evaluateHypothesis(candlesB, timelineB, hypothesis, { minSwingPct: 0.10, minOosTriggers: 2 });
+    expect(resB2.oosTriggerCount).toBeGreaterThanOrEqual(2);
+    expect(resB2.oosWinRate).toBe(0);
+    expect(resB2.oosStatus).toBe("oos_degraded");
   });
 
   it("TC-EV-04: Insufficient sample threshold intercept (< 8 triggers flagged insufficient_sample)", () => {
@@ -309,5 +314,49 @@ describe("hypothesisEvaluator", () => {
     // Warmup: bars before startIndex are not scanned
     const resWarm = evaluateHypothesis(candles, timeline, hypothesis, { horizonBars: 40, startIndex: 50 });
     expect(resWarm.triggeredIndices).toEqual([61]);
+  });
+
+  it("TC-EV-06: Wilson lower bound, binomial p-value significance, and near-trigger proximity", () => {
+    // 3/3 = 100% raw win rate has a much lower Wilson bound than 18/20 = 90%
+    const lb3of3 = wilsonLowerBound(3, 3);
+    const lb18of20 = wilsonLowerBound(18, 20);
+    expect(lb18of20).toBeGreaterThan(lb3of3);
+
+    // 9 wins out of 10 against 25% baseline is statistically significant (p < 0.05)
+    const pSig = binomialUpperTail(9, 10, 0.25);
+    expect(pSig).toBeLessThan(0.05);
+
+    // 5 wins out of 10 against 45% baseline is not significant
+    const pNonSig = binomialUpperTail(5, 10, 0.45);
+    expect(pNonSig).toBeGreaterThan(0.05);
+
+    // Near-trigger closeness calculation
+    const candles = createCandles(80, 100);
+    // Slight dip on the last bar so J is low (~20, near threshold 10)
+    candles[79] = { ...candles[79], open: 99.8, high: 100, low: 99.6, close: 99.7 };
+    const timeline = buildFeatureTimeline(candles);
+    const latestFeature = timeline[timeline.length - 1];
+
+    const fakeResult = evaluateHypothesis(
+      candles,
+      timeline,
+      {
+        id: "near_1",
+        category: "bullish_entry",
+        title: "EMA20 支撑 + RSI < 35",
+        conditions: [
+          { type: "price_near_ma", params: { maKey: "EMA20", minPct: -2.5, maxPct: 2.5 } },
+          { type: "rsi_zone", params: { mode: "below", threshold: 35 } },
+        ],
+        aiRationale: "test",
+      },
+      { minTriggers: 1 }
+    );
+    // Force status to high_confidence to test near-trigger ranking
+    fakeResult.status = "high_confidence";
+    const near = buildNearTriggers([fakeResult], latestFeature, 5);
+    expect(near.length).toBe(1);
+    expect(near[0].conditions.length).toBe(2);
+    expect(near[0].closeness).toBeGreaterThan(0.5);
   });
 });
